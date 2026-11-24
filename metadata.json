@@ -1,0 +1,6 @@
+{
+  "name": "BetManager",
+  "description": "Precision crash-game strategy and stake automation assistant powered by Android Accessibility Service.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

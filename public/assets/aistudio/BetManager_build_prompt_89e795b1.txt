@@ -1,0 +1,254 @@
+BETMANAGER - BUILD PROMPT
+=========================
+Give this whole file to the coding agent together with the predict-manager_4 source
+(with the patched AccessibilityController.kt / AutomationEngine.kt already applied) and
+the AutoTouch source (AutoService.kt is the reference for tapping and typing).
+
+GOAL
+----
+Turn Predict Manager into "BetManager": a small, simple app that plays a crash game
+(BetPawa Aviator in Chrome) for the user, the way a careful person would:
+look at the screen, find the buttons, check the rules, set the stake, bet, and let the
+GAME's own Auto Cash Out take the money out at the user's target.
+It must never bet blind and never touch a box it did not mean to touch.
+
+0. HARD RULES (every one needs a test)
+--------------------------------------
+R1  No blind bet. A bet is clicked only after: the stake box reads back the exact stake,
+    the Bet button was re-found on a fresh scan, and the phase is "betting open".
+R2  The multiplier box (Auto Cash Out value) is never edited while setting the stake,
+    and the stake box is never confused with it. Different rows, different bounds.
+R3  Every tap/type comes from the AutoTouch method (section 2). No other method.
+R4  Scanning is rare (section 3). No continuous scanning.
+R5  No min/max stake feature anywhere (section 6). The app uses what the user set.
+R6  Nothing is hidden: if the app does not bet, the screen says why in one plain line.
+
+1. APP IDENTITY AND SIMPLE UI
+-----------------------------
+- App name "BetManager" (strings.xml app_name, launcher label, notification titles,
+  accessibility service label/description, overlay titles, README). Search the whole
+  project for "Predict Manager", "PredictManager", "Predict" and replace in UI text.
+  Keep the Kotlin package com.example so the database and tests still work.
+- Remove the top static HUD completely: the strip with LAST CRASH / ROUND: Unknown /
+  Rounds / PAUSED text (ScreenEarnerOverlayService + CrashGridComponents header +
+  FloatingHandsOverlayManager). No "round unknown", no crash grid on the overlay.
+- Screens, bottom bar with exactly 4 tabs:
+    1. Home     - one big Start/Stop button, one status line, game name + site,
+                  balance, current stake, last 5 results (win/loss), today's profit.
+    2. Settings - section 4.
+    3. Strategy - existing rules list, shown as simple on/off cards (keep existing
+                  StrategyScreen logic, remove the extra analytics around it).
+    4. Logs     - plain list of what happened and why (reuse DiagnosticLogsPanel).
+  Delete from navigation: Live Monitor, Hourly Analysis, Pattern Recognition,
+  Notification Center, Risk Manager screen, Overlay Manager screen, Appearance screen.
+  Keep their code only if something still imports it; otherwise delete the files.
+- Overlay: ONE small draggable button (start/stop) plus a one-line status chip.
+  Keep the BET and CASH hands only as an optional toggle, off by default.
+- Status line wording (examples): "Looking at the game...", "Waiting for a trigger",
+  "Setting stake 20.00", "Bet placed 20.00", "Round running - game cashes out at 2.00x",
+  "Won +20.00", "Lost -20.00, next stake 40.00", "Stopped: <reason>".
+
+2. TAP AND TYPE ENGINE (copy AutoTouch's logic)
+------------------------------------------------
+Create service/AutoTouchDriver.kt. It is the ONLY class that performs actions.
+AccessibilityController keeps scanning only. Port exactly this behaviour from
+AutoTouch AutoService.kt:
+
+2.1 Finding a control
+    - findNode(query, editableOnly): walk every window root except our own package,
+      breadth-first, visible nodes only, compare lowercase text / contentDescription /
+      hintText / viewId. Exact match wins, partial match is the fallback.
+    - waitForNode(query, timeout 3000 ms, poll 250 ms).
+    - For BetPawa also locate by GEOMETRY (the scan result), because the Bet button
+      text is "Bet" + newline + "400.00 TZS" and the tabs are also called "Bet" / "Auto".
+2.2 Click
+    - Walk up from the found node to the first clickable parent and ACTION_CLICK it.
+    - If there is none, or the action returns false, tap the centre of the node with
+      dispatchGesture, a 50 ms stroke, and wait for the gesture callback.
+    - NEVER refuse a tap because the node is "not clickable". Refuse only when the
+      node is disabled (isEnabled=false) or not visible.
+    - Same-coordinate debounce may skip a duplicate tap but must report "skipped",
+      not "failed", and must never cancel a bet sequence.
+2.3 Type (stake)
+    a. Click the field (section 2.2) so the page really focuses it, wait 200 ms.
+    b. Take the FOCUSED input: root.findFocus(FOCUS_INPUT). Use it only if its bounds
+       overlap the stake box bounds; otherwise stop with "wrong field focused".
+    c. ACTION_SET_TEXT with the full new text (e.g. "20.00"). Do NOT clear first.
+    d. Poll the read-back up to 5 times, 100 ms apart. Accept when |value - stake| <= 0.05.
+    e. If still wrong after 600 ms: one retry of a-d. After that stop the bet with the
+       reason "stake could not be set (field shows X)". No paste fallback. No guessing.
+    f. Close the keyboard (GLOBAL_ACTION_BACK only if an input-method window exists),
+       wait until the Bet button bounds are identical on two scans 120 ms apart
+       (timeout 1500 ms), then re-find the Bet button. Abort if the layout never settles.
+2.4 Stake box vs multiplier box (rule R2)
+    - Stake box = the editable field in the same row as the "-" and "+" steppers, or the
+      editable field closest to the green Bet button on its left.
+    - Multiplier box = the editable field to the right of the "Auto Cash Out" label.
+    - If the two bounds intersect, or the chosen stake field text parses as the user's
+      target multiplier while a different editable field exists, pick the other one.
+    - The action layer takes explicit bounds from the scan. It never searches for "the
+      first numeric field".
+2.5 Two bet panels
+    BetPawa can show two Bet panels. Use ONLY the top panel (first in tree order) and
+    log "using hand 1". If the user collapses the second panel, nothing changes.
+
+3. SCANNING SCHEDULE (rule R4)
+------------------------------
+Full scan (A11y tree + optional screen capture/OCR) happens only:
+    S1  once when the user presses Start: find the game, site/url, title, balance,
+        currency, Bet button, stake box, stake steppers, Auto Cash Out row (switch,
+        value box), phase. Store this as the "screen map".
+    S2  right before each bet attempt (one fresh scan to re-validate bounds/phase).
+    S3  once after the click to confirm the bet was accepted (Cancel visible, or the
+        round started). Max 3 quick polls, 150 ms apart.
+    S4  a slow heartbeat every 5 seconds while running, only to read: phase, live
+        multiplier, balance, crash result. It must be lightweight (no OCR, no node
+        dump logging).
+    S5  immediately when the foreground package changes, the screen rotates, or the
+        keyboard closes.
+Remove: per-event scanning, the 100 ms notification-timeout scan storm, hierarchy
+logging on every event, continuous OCR. Throttle accessibility events:
+accessibilityEventTypes = typeWindowStateChanged|typeWindowContentChanged and ignore
+content-changed events unless a scan is due. Do scanning off the main thread; only the
+final performAction/dispatchGesture runs on the main thread (the logs showed a 2.3 s
+delay between "click requested" and "gesture dispatched").
+
+4. SETTINGS (simple, in this order)
+-----------------------------------
+4.1 Stake
+    - Base stake (number, required).
+    - After a loss (segmented choice): Double | Add amount | Keep same.
+        Double      -> next = previous * 2
+        Add amount  -> next = previous + "Add amount" (a number field, shown only here)
+        Keep same   -> next = base
+    - After a win: always return to base stake.
+    - "Stop after N losses in a row" (number, 0 = never) -> then back to base and pause.
+    - No minimum stake, no maximum stake field, no learning of limits, no "-" probing.
+4.2 Cash out
+    - "Cash out at" multiplier (number, e.g. 2.00).
+    - Switch: "Use the game's own Auto Cash Out" (default ON).
+        ON  -> before betting, make the game's row match: switch ON and value = target
+               (section 5). The app does not press Cash Out itself.
+        OFF -> the app watches the live multiplier and presses the game's Cash Out
+               button at the target (existing logic, tap via the driver).
+4.3 When to bet
+    - Mode: "Bet every round" | "Use my strategy rules".
+    - Strategy rules: the existing rules and pattern triggers, unchanged.
+4.4 Safety
+    - Stop when today's loss reaches X (0 = off), stop when today's profit reaches Y
+      (0 = off). Balance floor: stop when balance < Z (0 = off).
+4.5 Keep all other existing settings working; move rarely used ones under "More".
+Delete the settings: minStake, maxStake, learned limits, queueBetDuringFlight UI,
+cashOutUntrackedBets UI (keep default false), timeouts UI (keep sane defaults in code),
+profile min/max stake columns usage. Keep the DB columns (do not break migrations) but
+stop reading and writing them. Delete probeMinStake, stakeMinusBounds use, learnStakeLimits,
+parseSiteStakeLimits usage and their tests; keep the stepper bounds only for the optional
+fallback "tap + / - to reach the stake" if the typed edit fails twice.
+
+5. GAME'S OWN AUTO CASH OUT (precise edit)
+------------------------------------------
+Run once per start and again whenever the scan shows the row differs from the setting.
+ 1. If the Auto Cash Out row is not visible, tap the "Auto" tab (top panel only) and
+    wait up to 900 ms for the row. Never tap the "Bet" tab afterwards unless needed.
+ 2. Read: switch state (checked flag, else pixel colour from the screen frame), and the
+    value box text.
+ 3. If value == target (+-0.005) and the switch is ON -> do nothing.
+ 4. If the switch is OFF and readable -> tap the switch, re-scan, confirm ON.
+    If the switch state is UNREADABLE -> do not toggle. Log "cannot read switch" and
+    continue only if the value already equals the target. Otherwise stop with a clear
+    message. NEVER edit the value box until the switch is confirmed ON.
+ 5. If the value differs: focus the value box using section 2.3 (same steps, same
+    verification, target text "2.00"), confirm by read-back, then close the keyboard.
+ 6. If any step fails, leave the box exactly as the user left it and say so.
+ 7. Never tap the "x" clear icon next to the value.
+
+6. THE BET SEQUENCE (one function, strictly in this order)
+----------------------------------------------------------
+ 1. Pre-checks: running, game window found, phase == BETTING_OPEN (not in flight, not
+    crashed), no bet already active, balance >= stake, today's limits not reached.
+ 2. Strategy: decide stake (section 4.1) and whether a trigger is met. If not met, wait.
+ 3. Fresh scan (S2). Conflict or missing Bet button -> abort with reason.
+ 4. Auto Cash Out check/edit if enabled (section 5).
+ 5. Set stake with the driver (section 2.3). Verified by read-back.
+ 6. Settle layout, fresh scan, re-find Bet button, re-verify the stake text.
+ 7. Tap the Bet button (section 2.2).
+ 8. Confirm (S3): Cancel button or round start. If not confirmed in 1800 ms ->
+    "bet not confirmed", do NOT retry blindly, wait for the next round.
+ 9. Record: bet placed, stake, target. When the round ends: win if the game cashed out
+    (Cash Out button vanished after being seen, or crash >= target with game ACO armed),
+    loss otherwise. Update the next stake. Log both in plain words.
+The window budget is 6 seconds. If the budget runs out, abort cleanly; never click late.
+
+7. ERRORS TO REMOVE / NEVER REPEAT (seen in real logs)
+------------------------------------------------------
+ E1  "Stake verification mismatch ... game displays '11.00' / '400.00' / '50.00'":
+     caused by reading too early and then pasting on top. Fixed by 2.3 (focus, set,
+     poll, no paste, no clear).
+ E2  "game=Edge panels": system surfaces were treated as the game. Ignore events and
+     windows from Samsung Edge panel, launcher, systemui, keyboard.
+ E3  "Balance is UNAVAILABLE": read the balance at S1/S4 from the header; if it is
+     hidden behind our overlay, move the overlay, do not block the bet on balance
+     unless the user enabled a balance floor.
+ E4  Bet refused because the node was "not clickable": remove that gate (2.2).
+ E5  Cash out at 11.9x for a 2.0x target with 2.3 s click delay: caused by main-thread
+     scanning and by tracking a hand-placed bet late. Keep scanning off the main thread
+     and keep cashing out only what BetManager placed.
+ E6  First round wasted on probing limits: removed with the min/max feature.
+ E7  A wrong saved limit blocking every bet: removed with the min/max feature.
+
+8. FILES (what to create, change, delete)
+-----------------------------------------
+CREATE
+  service/AutoTouchDriver.kt          section 2, with unit-testable pure helpers
+  service/ScreenMap.kt                data class of the S1 scan (game, site, balance,
+                                      bet/stake/ACO bounds, phase) + staleness timer
+  service/ScanScheduler.kt            section 3 (S1-S5), single place that decides scans
+  data/engine/BetSequence.kt          section 6, thin; calls driver + strategy
+  data/engine/StakeCalculator.kt      section 4.1, pure functions (base/double/add/keep)
+  ui/screens/SimpleHomeScreen.kt, SimpleSettingsScreen.kt
+CHANGE
+  res/values/strings.xml, AndroidManifest.xml, README.md   name -> BetManager
+  res/xml/accessibility_service_config.xml                 keep flags, add
+        flagIncludeNotImportantViews, canPerformGestures, canRetrieveWindowContent;
+        notificationTimeout 300
+  service/AccessibilityController.kt  keep scanScan/scanWindowTargets and detection;
+        delete click/type/probe/ACO write code (moved to the driver)
+  service/ScreenEarnerAccessibilityService.kt   event throttling, call ScanScheduler
+  data/engine/AutomationEngine.kt     replace executeVerifiedBetSequence with BetSequence;
+        remove limit learning and probing; keep strategy, settle, daily-limit logic
+  data/model/StrategyConfig.kt        add: afterLoss (DOUBLE|ADD|KEEP), addAmount,
+        stopAfterLosses; keep old fields so the DB still opens (version bump + migration)
+  ui/ScreenEarnerViewModel.kt, MainActivity.kt   4-tab navigation
+  service/ScreenEarnerOverlayService.kt, FloatingHandsOverlayManager.kt
+        remove the static HUD, one start/stop button + status chip
+DELETE (or stop referencing)
+  Live Monitor, Hourly Analysis, Pattern Recognition, Notification Center,
+  Risk Manager, Overlay Manager, Appearance screens; CrashGridComponents header HUD;
+  probeMinStake / learned limits / parseSiteStakeLimits; BetTransactionManager may stay
+  as the log source but must not gate a bet.
+
+9. TESTS THE AGENT MUST WRITE AND PASS (Robolectric, fake trees from the screenshots)
+------------------------------------------------------------------------------------
+ T1  Stake box chosen correctly when an Auto Cash Out value box "2.00" is also editable.
+ T2  Type flow: click, focus, SET_TEXT, delayed read-back (value appears after 250 ms)
+     -> accepted, and the field is never pasted into.
+ T3  Read-back stays wrong -> bet aborted with the reason, no Bet tap.
+ T4  Bet button node not clickable but enabled -> tapped by gesture, not refused.
+ T5  Bet button disabled -> refused.
+ T6  Layout moves after keyboard closes -> Bet bounds re-found before the tap.
+ T7  Auto Cash Out: switch OFF -> toggled then value edited; switch unreadable and value
+     different -> nothing touched; value already right -> nothing touched.
+ T8  StakeCalculator: base 10, loss, loss, win with Double -> 10, 20, 40, 10;
+     Add 5 -> 10, 15, 20, 10; Keep -> 10, 10, 10.
+ T9  Scan schedule: during 60 simulated seconds only S4 heartbeats happen (12 scans max).
+ T10 Phase gating: plane flying with Bet button visible -> no bet.
+ T11 Two Bet panels -> top panel used.
+
+10. DEFINITION OF DONE
+----------------------
+ - App shows "BetManager" everywhere, 4 tabs, no static HUD, no "round unknown".
+ - No code path references minStake/maxStake or learns limits.
+ - Start -> one full scan -> status "Waiting for a trigger" -> bet placed only when the
+   rules say so, with the stake confirmed on screen first.
+ - Logs show, for every bet: stake wanted, stake read back, Bet tapped, confirmed.
+ - All tests in section 9 pass; the build has no warnings about unused removed APIs.

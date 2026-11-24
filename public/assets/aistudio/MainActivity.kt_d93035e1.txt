@@ -1,0 +1,42 @@
+package com.example
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.ui.BetManagerViewModel
+import com.example.ui.screens.BetManagerRoot
+import com.example.ui.theme.BetManagerTheme
+
+class MainActivity : ComponentActivity() {
+
+    private val requestNotificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val lightBars = SystemBarStyle.light(0xFFEBECEE.toInt(), 0xFFEBECEE.toInt())
+        enableEdgeToEdge(statusBarStyle = lightBars, navigationBarStyle = lightBars)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        setContent {
+            BetManagerTheme {
+                val vm: BetManagerViewModel = viewModel()
+                BetManagerRoot(viewModel = vm)
+            }
+        }
+    }
+}

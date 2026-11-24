@@ -1,0 +1,10 @@
+Copy each file (remove the .txt) into app/src/main/ :
+java/com/example/ui/theme/Color.kt
+java/com/example/ui/theme/Theme.kt
+java/com/example/ui/components/BmButtons.kt        (NEW folder: components)
+java/com/example/ui/screens/SimpleHomeScreen.kt
+java/com/example/MainActivity.kt
+java/com/example/service/FloatingHandsOverlayManager.kt
+java/com/example/service/ScreenEarnerAccessibilityService.kt
+res/values/themes.xml
+Not compiled or run. Settings/Strategy screens only inherit the new theme.

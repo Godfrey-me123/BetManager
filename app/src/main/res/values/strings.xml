@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">BetManager</string>
+    <string name="service_label">BetManager Automation</string>
+    <string name="service_description">Lets BetManager read game screens, verify stake amounts, and place single confirmed bets according to your configured strategy rules. Never edits blind fields or runs without your Start action.</string>
+    <string name="overlay_channel_name">BetManager Status</string>
+    <string name="overlay_channel_description">Shows active status and floating control notifications for BetManager.</string>
+    <string name="overlay_notification_title">BetManager Active</string>
+    <string name="overlay_notification_paused">BetManager Ready</string>
+</resources>

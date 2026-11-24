@@ -1,0 +1,202 @@
+package com.example.service
+
+import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.content.res.Configuration
+import android.view.accessibility.AccessibilityEvent
+import com.example.data.engine.AutomationEngine
+import com.example.data.local.BetManagerDatabase
+import com.example.data.local.BetManagerRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
+
+/**
+ * BetManager AccessibilityService.
+ * Throttles events via ScanScheduler, ignores system surfaces (Edge panels, SystemUI, launchers, IMEs),
+ * runs scanning off the main thread, and hosts the single draggable floating BET hand.
+ */
+class ScreenEarnerAccessibilityService : AccessibilityService() {
+
+    companion object {
+        var instance: ScreenEarnerAccessibilityService? = null
+            private set
+
+        @Volatile
+        var sharedEngine: AutomationEngine? = null
+            private set
+
+        fun getOrCreateEngine(repository: BetManagerRepository): AutomationEngine {
+            return sharedEngine ?: synchronized(this) {
+                sharedEngine ?: AutomationEngine(repository).also { sharedEngine = it }
+            }
+        }
+    }
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var stateObserverJob: Job? = null
+
+    private lateinit var repository: BetManagerRepository
+    private lateinit var engine: AutomationEngine
+    private lateinit var driver: AutoTouchDriver
+    private lateinit var scheduler: ScanScheduler
+    private var overlayManager: FloatingHandsOverlayManager? = null
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+
+        val db = BetManagerDatabase.getInstance(applicationContext)
+        repository = BetManagerRepository(applicationContext, db.betManagerDao())
+        engine = getOrCreateEngine(repository)
+
+        val platform = AndroidAccessibilityPlatform(this)
+        driver = AutoTouchDriver(platform)
+        scheduler = ScanScheduler(platform)
+        engine.attachAccessibility(driver, scheduler)
+
+        overlayManager = FloatingHandsOverlayManager(
+            context = this,
+            repository = repository,
+            onBetHandTapped = { engine.triggerManualHandBet() },
+            onToggleStartStop = {
+                if (engine.state.value.isRunning) engine.stop() else engine.start()
+            },
+            onStakeStep = { dir -> stepBaseStake(dir) },
+            onOpenApp = {
+                startActivity(
+                    Intent(this, com.example.MainActivity::class.java)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                )
+            }
+        )
+
+        stateObserverJob?.cancel()
+        stateObserverJob = serviceScope.launch {
+            combine(
+                engine.state,
+                repository.configFlow,
+                repository.lastFiveBetResultsFlow,
+                repository.todayProfitFlow()
+            ) { ui, config, last, profit -> OverlayData(ui, config, last, profit) }
+                .collectLatest { d ->
+                    val ui = d.ui
+                    if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
+                    val stake = if (ui.isRunning) ui.currentStake else d.config.baseStake
+                    overlayManager?.update(
+                        OverlayInfo(
+                            isRunning = ui.isRunning,
+                            statusLine = ui.statusLine,
+                            gameLine = "${ui.gameName} · ${ui.siteUrl}",
+                            balanceText = ui.balance?.let { "%.2f %s".format(it, ui.currency) } ?: "--",
+                            stakeText = "%.2f %s".format(stake, ui.currency),
+                            lossStreak = ui.consecutiveLosses,
+                            phaseText = ui.phase.name.lowercase().replace('_', ' '),
+                            multiplierText = ui.liveMultiplier?.let { "%.2fx".format(it) } ?: "",
+                            todayProfitText = "%+.2f".format(d.profit),
+                            lastResults = d.last.mapNotNull { it.won }.reversed(),
+                            handState = ui.handState,
+                            canEditStake = !ui.isRunning
+                        )
+                    )
+                }
+        }
+    }
+
+    private class OverlayData(
+        val ui: com.example.data.engine.EngineUiState,
+        val config: com.example.data.model.StrategyConfig,
+        val last: List<com.example.data.model.RoundRecord>,
+        val profit: Double
+    )
+
+    /** Overlay stake -/+ : only while stopped. Step scales with the base stake. */
+    private fun stepBaseStake(dir: Int) {
+        if (engine.state.value.isRunning) return
+        serviceScope.launch {
+            val c = repository.getConfig()
+            val step = when {
+                c.baseStake >= 100 -> 50.0
+                c.baseStake >= 20 -> 10.0
+                else -> 1.0
+            }
+            val newBase = maxOf(1.0, c.baseStake + dir * step)
+            repository.saveConfig(c.copy(baseStake = newBase))
+            repository.saveSessionProgression(newBase, 0)
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null || !::scheduler.isInitialized) return
+        val pkg = event.packageName?.toString()
+        if (AccessibilityController.isIgnoredSystemPackage(pkg, packageName)) return
+
+        val isWindowStateChanged = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        // Ignore content-changed event storms; only respond to S5 context shifts
+        if (!isWindowStateChanged) return
+
+        serviceScope.launch {
+            val imeVisible = AndroidAccessibilityPlatform(this@ScreenEarnerAccessibilityService).hasImeWindow()
+            val config = repository.getConfig()
+            val scan = scheduler.onWindowEvent(
+                packageName = pkg,
+                isWindowStateChanged = true,
+                isImeVisible = imeVisible,
+                targetCashOutMultiplier = config.cashOutTarget
+            )
+            if (scan != null) {
+                engine.handleScreenEvent(scan)
+            }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (!::scheduler.isInitialized) return
+        serviceScope.launch {
+            val config = repository.getConfig()
+            val scan = scheduler.onOrientationChanged(config.cashOutTarget)
+            engine.handleScreenEvent(scan)
+        }
+    }
+
+    fun showFloatingHand() {
+        overlayManager?.show()
+    }
+
+    fun hideFloatingHand() {
+        overlayManager?.hide()
+    }
+
+    override fun onInterrupt() {
+        if (::engine.isInitialized) {
+            engine.stop("accessibility interrupted")
+        }
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        cleanup()
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        cleanup()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    private fun cleanup() {
+        stateObserverJob?.cancel()
+        overlayManager?.hide()
+        if (::engine.isInitialized) {
+            engine.detachAccessibility()
+        }
+        ScreenEarnerOverlayService.clearStatusNotification(this)
+        instance = null
+    }
+}

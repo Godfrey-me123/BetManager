@@ -1,0 +1,359 @@
+package com.example.service
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
+import com.example.data.engine.FloatingHandState
+import com.example.data.local.BetManagerRepository
+import kotlin.math.abs
+
+/** Everything the floating panel shows. Built by the accessibility service from engine + settings state. */
+data class OverlayInfo(
+    val isRunning: Boolean = false,
+    val statusLine: String = "Ready",
+    val gameLine: String = "",
+    val balanceText: String = "--",
+    val stakeText: String = "--",
+    val lossStreak: Int = 0,
+    val phaseText: String = "",
+    val multiplierText: String = "",
+    val todayProfitText: String = "",
+    /** Last results, oldest first: true = win, false = loss. */
+    val lastResults: List<Boolean> = emptyList(),
+    val handState: FloatingHandState = FloatingHandState.WAITING,
+    /** Stake can be changed only while stopped. */
+    val canEditStake: Boolean = true
+)
+
+/**
+ * The BetManager floating overlay (TYPE_ACCESSIBILITY_OVERLAY, needs no extra permission):
+ *  - collapsed: a small draggable "BM" bubble whose ring colour shows the state (waiting / ready / locked);
+ *  - expanded: a light-grey panel with status, game, balance, stake, loss streak, live multiplier, last results,
+ *    and flat buttons: BET (manual, only when ready), Start / Stop, stake - / +, Open app, collapse.
+ * Always available while the setting is on (also when the bot is stopped, so it can be started from here).
+ * Dragging never taps anything; the position is saved. Flat soft colours only: no gradients, no dark mode.
+ */
+class FloatingHandsOverlayManager(
+    private val context: Context,
+    private val repository: BetManagerRepository,
+    private val onBetHandTapped: () -> Unit,
+    private val onToggleStartStop: () -> Unit,
+    private val onStakeStep: (Int) -> Unit,
+    private val onOpenApp: () -> Unit
+) {
+    private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val density = context.resources.displayMetrics.density
+    private fun dp(v: Int) = (v * density).toInt()
+
+    private var bubbleView: TextView? = null
+    private var panelView: LinearLayout? = null
+    private var expanded = false
+    private var lastInfo = OverlayInfo()
+    private var lastTapAtMs = 0L
+    private var wasRunning = false
+
+    // panel widgets
+    private var statusText: TextView? = null
+    private var gameText: TextView? = null
+    private var balanceText: TextView? = null
+    private var stakeText: TextView? = null
+    private var liveText: TextView? = null
+    private var resultsText: TextView? = null
+    private var betButton: TextView? = null
+    private var startStopButton: TextView? = null
+    private var stakeMinus: TextView? = null
+    private var stakePlus: TextView? = null
+
+    private val layoutParams = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+        PixelFormat.TRANSLUCENT
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        val saved = repository.getOverlayPosition(dp(16), dp(180))
+        x = saved.first
+        y = saved.second
+    }
+
+    val isVisible: Boolean get() = bubbleView != null || panelView != null
+
+    // ------------------------------------------------------------------ public
+
+    fun show() {
+        if (isVisible) return
+        if (expanded) addPanel() else addBubble()
+        applyInfo(lastInfo)
+    }
+
+    fun hide() {
+        removeCurrent()
+    }
+
+    fun setExpanded(value: Boolean) {
+        if (expanded == value) return
+        expanded = value
+        if (!isVisible) return
+        removeCurrent()
+        if (expanded) addPanel() else addBubble()
+        applyInfo(lastInfo)
+    }
+
+    fun update(info: OverlayInfo) {
+        val startedNow = info.isRunning && !wasRunning
+        wasRunning = info.isRunning
+        lastInfo = info
+        // Keep the panel off the game while it works: collapse when the bot starts or is about to bet.
+        if (expanded && (startedNow || info.handState == FloatingHandState.READY && info.isRunning)) {
+            setExpanded(false)
+            return
+        }
+        applyInfo(info)
+    }
+
+    // ------------------------------------------------------------------ building
+
+    private fun stateColor(s: FloatingHandState): Int = when (s) {
+        FloatingHandState.READY -> C_GREEN
+        FloatingHandState.LOCKED -> C_GREY_DARK
+        FloatingHandState.WAITING -> C_AMBER
+    }
+
+    private fun flat(fill: Int, stroke: Int, radiusDp: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.RECTANGLE
+        setColor(fill) // a single flat colour, never a gradient
+        setStroke(dp(1), stroke)
+        cornerRadius = dp(radiusDp).toFloat()
+    }
+
+    private fun button(label: String, fill: Int, textColor: Int, stroke: Int, onClick: () -> Unit): TextView =
+        TextView(context).apply {
+            text = label
+            setTextColor(textColor)
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            minHeight = dp(44)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            background = flat(fill, stroke, 12)
+            setOnClickListener { onClick() }
+        }
+
+    private fun label(textValue: String, sizeSp: Float, color: Int, bold: Boolean = false): TextView =
+        TextView(context).apply {
+            text = textValue
+            textSize = sizeSp
+            setTextColor(color)
+            if (bold) typeface = Typeface.DEFAULT_BOLD
+        }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun dragListener(target: View): View.OnTouchListener {
+        var startX = 0
+        var startY = 0
+        var downX = 0f
+        var downY = 0f
+        var dragging = false
+        val threshold = dp(8).toFloat()
+        return View.OnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = layoutParams.x; startY = layoutParams.y
+                    downX = event.rawX; downY = event.rawY
+                    dragging = false
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = event.rawX - downX
+                    val dy = event.rawY - downY
+                    if (abs(dx) > threshold || abs(dy) > threshold) dragging = true
+                    if (dragging) {
+                        layoutParams.x = startX + dx.toInt()
+                        layoutParams.y = startY + dy.toInt()
+                        runCatching { wm.updateViewLayout(target, layoutParams) }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (dragging) {
+                        repository.saveOverlayPosition(layoutParams.x, layoutParams.y)
+                    } else {
+                        // A plain tap on the bubble expands it; on the panel header it collapses it.
+                        setExpanded(!expanded)
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun addBubble() {
+        val bubble = TextView(context).apply {
+            text = "BM"
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(C_INK)
+            gravity = Gravity.CENTER
+            minWidth = dp(52)
+            minHeight = dp(52)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(C_PANEL)
+                setStroke(dp(3), C_AMBER)
+            }
+        }
+        bubble.setOnTouchListener(dragListener(bubble))
+        runCatching { wm.addView(bubble, layoutParams) }
+        bubbleView = bubble
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun addPanel() {
+        val panel = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+            background = flat(C_PANEL, C_BORDER, 18)
+            minimumWidth = dp(264)
+        }
+
+        // header (drag handle + collapse)
+        val header = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = label("BetManager", 15f, C_INK, bold = true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val collapse = button("Hide", C_SOFT, C_INK, C_BORDER) { setExpanded(false) }.apply {
+            minHeight = dp(36)
+            textSize = 12f
+        }
+        header.addView(title)
+        header.addView(collapse)
+        header.setOnTouchListener(dragListener(panel))
+        title.setOnTouchListener(dragListener(panel))
+        panel.addView(header)
+
+        statusText = label("Ready", 13f, C_INK).apply { setPadding(0, dp(8), 0, dp(4)); maxLines = 2 }
+        gameText = label("", 12f, C_INK_SOFT)
+        balanceText = label("Balance --", 12f, C_INK_SOFT)
+        stakeText = label("Stake --", 13f, C_INK, bold = true).apply { setPadding(0, dp(4), 0, 0) }
+        liveText = label("", 12f, C_INK_SOFT)
+        resultsText = label("", 13f, C_INK).apply { setPadding(0, dp(4), 0, dp(8)) }
+        listOf(statusText, gameText, balanceText, stakeText, liveText, resultsText).forEach { panel.addView(it) }
+
+        val row1 = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        betButton = button("BET", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) { guardedBetTap() }
+        startStopButton = button("Start", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) { onToggleStartStop() }
+        row1.addView(betButton, weightParams(end = 6))
+        row1.addView(startStopButton, weightParams(start = 6))
+        panel.addView(row1)
+
+        val row2 = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        stakeMinus = button("Stake -", C_SOFT, C_INK, C_BORDER) { onStakeStep(-1) }
+        stakePlus = button("Stake +", C_SOFT, C_INK, C_BORDER) { onStakeStep(1) }
+        val open = button("Open app", C_SOFT, C_INK, C_BORDER) { onOpenApp() }
+        row2.addView(stakeMinus, weightParams(end = 4))
+        row2.addView(stakePlus, weightParams(start = 4, end = 4))
+        row2.addView(open, weightParams(start = 4))
+        panel.addView(row2)
+
+        runCatching { wm.addView(panel, layoutParams) }
+        panelView = panel
+    }
+
+    private fun weightParams(start: Int = 0, end: Int = 0) =
+        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginStart = dp(start)
+            marginEnd = dp(end)
+        }
+
+    private fun guardedBetTap() {
+        val now = System.currentTimeMillis()
+        if (lastInfo.handState == FloatingHandState.READY && now - lastTapAtMs > 650L) {
+            lastTapAtMs = now
+            onBetHandTapped()
+        }
+    }
+
+    private fun removeCurrent() {
+        bubbleView?.let { runCatching { wm.removeView(it) } }
+        panelView?.let { runCatching { wm.removeView(it) } }
+        bubbleView = null
+        panelView = null
+        statusText = null; gameText = null; balanceText = null; stakeText = null
+        liveText = null; resultsText = null; betButton = null; startStopButton = null
+        stakeMinus = null; stakePlus = null
+    }
+
+    // ------------------------------------------------------------------ updating
+
+    @SuppressLint("SetTextI18n")
+    private fun applyInfo(info: OverlayInfo) {
+        (bubbleView?.background as? GradientDrawable)?.setStroke(dp(3), stateColor(info.handState))
+
+        if (panelView == null) return
+        statusText?.text = info.statusLine
+        gameText?.text = info.gameLine
+        balanceText?.text = "Balance ${info.balanceText}" +
+            if (info.todayProfitText.isNotBlank()) "   Today ${info.todayProfitText}" else ""
+        stakeText?.text = "Stake ${info.stakeText}" + if (info.lossStreak > 0) "   Losses in a row: ${info.lossStreak}" else ""
+        liveText?.text = listOf(info.phaseText, info.multiplierText).filter { it.isNotBlank() }.joinToString("   ")
+        resultsText?.text = if (info.lastResults.isEmpty()) "No bets yet"
+        else "Last: " + info.lastResults.joinToString(" ") { if (it) "W" else "L" }
+
+        val ready = info.handState == FloatingHandState.READY
+        betButton?.apply {
+            text = when (info.handState) {
+                FloatingHandState.READY -> "BET"
+                FloatingHandState.LOCKED -> "Bet placed"
+                FloatingHandState.WAITING -> "Wait"
+            }
+            alpha = if (ready) 1f else 0.5f
+            isEnabled = ready
+        }
+        startStopButton?.apply {
+            if (info.isRunning) {
+                text = "Stop"
+                setTextColor(C_RED_DARK)
+                background = flat(C_RED_SOFT, C_RED_DARK, 12)
+            } else {
+                text = "Start"
+                setTextColor(C_GREEN_DARK)
+                background = flat(C_GREEN_SOFT, C_GREEN_DARK, 12)
+            }
+        }
+        val canEdit = info.canEditStake && !info.isRunning
+        listOf(stakeMinus, stakePlus).forEach { it?.alpha = if (canEdit) 1f else 0.4f; it?.isEnabled = canEdit }
+    }
+
+    private companion object {
+        // Flat, soft light-grey palette (no pure white / black, no gradients).
+        val C_PANEL = 0xF2EEEFF1.toInt()
+        val C_SOFT = 0xFFE1E3E6.toInt()
+        val C_BORDER = 0xFFC2C6CC.toInt()
+        val C_INK = 0xFF2D3138.toInt()
+        val C_INK_SOFT = 0xFF626975.toInt()
+        val C_GREEN = 0xFF4A8B6E.toInt()
+        val C_GREEN_SOFT = 0xFFD8E6DE.toInt()
+        val C_GREEN_DARK = 0xFF2F6650.toInt()
+        val C_AMBER = 0xFFB07F2E.toInt()
+        val C_RED_SOFT = 0xFFEBD3D0.toInt()
+        val C_RED_DARK = 0xFFB0524A.toInt()
+        val C_GREY_DARK = 0xFF7B828C.toInt()
+    }
+}

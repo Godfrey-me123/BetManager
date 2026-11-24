@@ -1,0 +1,29 @@
+You are updating the UI, branding, overlay, and navigation of the Android Kotlin project into **BetManager**[cite: 24]. Follow `BetManager_build_prompt.txt`[cite: 24] and the requirements below without breaking the underlying strategy, history, progression, or database layers[cite: 24].
+
+### 1. Rebrand to BetManager
+- Rename visible app branding from **Predict Manager** / **Screen Earner** / **AutoTouch** to **BetManager** across `res/values/strings.xml`, launcher label, notification titles, accessibility service label and description, overlay titles, visible headings, and `README.md`[cite: 23, 24].
+- Keep existing Kotlin package names (`com.example`) and database compatibility intact unless a migration is strictly required[cite: 24].
+- Remove references to min/max stake limits, limit learning/probing, and app-controlled cashout controls from visible settings and UI[cite: 24].
+
+### 2. Simplify Overlay to One BET Hand
+- Keep only **one draggable floating BET hand/control** plus a compact status chip/indicator[cite: 24].
+- Remove the separate **CASH OUT** floating hand, its action controls, and all app-controlled cashout click paths (the game's built-in Auto Cash Out handles cashing out)[cite: 24].
+- Remove the old top static HUD strip/bar (`LAST CRASH`, `ROUND: Unknown`, `Rounds`, `PAUSED`, and crash grid headers on the overlay)[cite: 24].
+- Make sure the floating BET hand:
+  - Shows a waiting state when no eligible betting opportunity exists.
+  - Becomes ready when the game is in the correct betting phase and the configured strategy or manual action permits a bet.
+  - Executes at most **one** verified BET action per round and locks immediately once confirmed.
+  - Stays locked while that bet is active and while the round is running, unlocking only after the round completes and a new eligible betting opportunity is valid.
+  - Never triggers a bet during dragging/repositioning, and preserves its saved position and existing hand configuration.
+  - Never fires duplicate bets from repeated taps, duplicate events, or repeated strategy notifications.
+
+### 3. Four-Tab Navigation & Screens
+Set up a clean bottom navigation bar with **4 main tabs**[cite: 24]:
+1. **Home** — Start/Stop control, status line, game/site status, current stake, last results (win/loss), and today's performance/profit[cite: 24].
+2. **Settings** — Base stake, after-loss progression (`Double` | `Add amount` | `Keep same`), return to base stake after win, `Stop after N losses in a row`, built-in Auto Cash Out target/toggle, betting mode (`Bet every round` | `Use my strategy rules`), safety stop limits (daily loss, daily profit, balance floor), and existing settings (moving rarely used ones under **More**)[cite: 24].
+3. **Strategy** — Existing strategy rules and custom pattern configuration (on/off cards and existing rule management, preserving all strategy types, custom patterns, multiplier/color/time rules, and waiting periods)[cite: 24].
+4. **Logs** — Clear chronological log records of detection, strategy triggers, stake changes, BET attempts, confirmations, wins, losses, and reasons why actions were skipped[cite: 24].
+
+Remove or stop referencing obsolete screens from active navigation (`Live Monitor`, `Hourly Analysis`, `Pattern Recognition`, `Notification Center`, `Risk Manager`, `Overlay Manager`, `Appearance`) unless required by an active reference, while preserving saved data, round history, strategy progress, and configuration across stops, restarts, and rebuilds[cite: 24].
+
+Inspect the relevant UI, overlay, manifest, resource, and navigation files first, list the files you will edit or remove, and then apply the changes cleanly.

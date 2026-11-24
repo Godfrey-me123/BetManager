@@ -1,0 +1,19 @@
+You are rebuilding and renaming this Android Kotlin project into **BetManager**.
+Use `AutoTouch-latest_all_files.txt`[cite: 23] as the reference source for tapping and typing behavior (do not treat `.txt` reference files as executable Android source files), and follow `BetManager_build_prompt.txt`[cite: 24] together with the requirements below.
+
+Before making edits, inspect the project files, reconcile any duplicate or empty files (such as checking `public/assets/aistudio/` snapshots against `app/src/...` files like `AutomationEngine.kt`, `BetSequence.kt`, `MainActivity.kt`, `AutoTouchDriver.kt`, etc.)[cite: 22], and preserve existing database compatibility, round history, strategy rules, pattern rules, and configuration[cite: 24].
+
+### Latest Workflow Direction
+- Strategy detects the trigger -> configured stake is applied -> one BET action is placed -> the BET hand locks -> the game handles Auto Cash Out -> the app reads the result and updates progression.
+- Do NOT perform app-controlled CASH OUT or maintain a separate CASH OUT floating hand; let the game's own Auto Cash Out handle cashing out[cite: 24].
+
+### Hard Rules & Core Requirements
+1. **No Blind Bets & Stake Verification:** Only click BET after verifying the stake box reads back the configured stake (with a short poll/settle delay), refreshing the layout after closing any keyboard, re-finding the BET button with fresh bounds, and confirming the phase is open for betting[cite: 24].
+2. **Stake Box vs. Auto Cash Out Box:** Identify the stake field by its position/relationship to the BET panel and steppers—never the first editable numeric field or the Auto Cash Out multiplier field[cite: 24]. If two bet panels exist, use only the top panel[cite: 24].
+3. **AutoTouch Driver Layer (`AutoTouchDriver.kt`):** Centralize tap/click and text-entry actions using `AutoTouch-latest_all_files.txt` (`AutoService.kt` / `MacroParser.kt`)[cite: 23, 24]. Do not reject an enabled BET button merely because its accessibility node reports `isClickable = false`; fall back to a gesture tap at verified center coordinates if needed[cite: 23, 24]. Keep accessibility scanning off the main thread[cite: 24].
+4. **Controlled Scanning (`ScanScheduler.kt`):** Avoid continuous scanning or per-event scan storms[cite: 24]. Scan on start, before a bet attempt, briefly to confirm bet acceptance, on a slow heartbeat, and on window/package/orientation/keyboard changes[cite: 24]. Ignore system surfaces (Samsung Edge panels, launchers, keyboards, SystemUI)[cite: 24].
+5. **Single BET Hand & Compact Overlay:** Keep only one draggable floating BET hand/control that shows waiting/ready states, places at most one verified BET per round, locks immediately upon confirmation, and unlocks only after the round finishes and a new betting opportunity is valid[cite: 24]. Remove separate CASH OUT hands and static HUD strips/grids[cite: 24].
+6. **Strategies, Progression & Persistence:** Preserve existing strategies, custom patterns, and progression modes (Double / Add amount / Keep same after loss, reset to base stake after win, and stop-after-N-losses)[cite: 24]. Never wipe saved history, patterns, or configuration on stop/restart/rebuild[cite: 24]. Do not block betting solely because balance cannot be read unless a configured balance floor is triggered[cite: 24].
+7. **Branding & 4-Tab UI:** Rename visible app branding to **BetManager** while keeping `com.example` package/database compatibility[cite: 24]. Organize navigation into 4 tabs (**Home**, **Settings**, **Strategy**, **Logs**), remove obsolete screens/min-max stake limit probing, and write/run tests covering stake selection, verification, fresh button bounds, duplicate BET prevention, phase gating, progression, and scan scheduling[cite: 24].
+
+Start by inspecting the project and `AutoTouch-latest_all_files.txt`[cite: 22, 23, 24], listing authoritative vs. empty/conflicting files and your step-by-step plan before applying edits.

@@ -1,0 +1,1232 @@
+AUTOTOUCH LATEST — SOURCE FILE EXPORT
+Text files included: 19
+Original file paths are preserved below. File contents are not intentionally modified.
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/.github/workflows/build-apk.yml
+====================================================================================================
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk AutoTouch.apk
+
+      - name: Upload APK as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTouch-apk
+          path: AutoTouch.apk
+
+      - name: Publish APK to the "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: AutoTouch (latest build)
+          body: Built automatically from commit ${{ github.sha }}. Download AutoTouch.apk below and open it on your phone.
+          prerelease: false
+          make_latest: true
+          files: AutoTouch.apk
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/.gitignore
+====================================================================================================
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+*.jks
+*.keystore
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/README.md
+====================================================================================================
+# AutoTouch – Android typing & touch automation
+
+Runs a simple macro script (tap, swipe, long-press, type, click-by-text…) inside any app,
+controlled from a floating panel. Built on Android's Accessibility Service, which is the
+only supported way for an app to touch and type into other apps without root.
+
+## Build & install
+1. Open the `AutoTouch` folder in Android Studio (Koala or newer). Let Gradle sync –
+   it downloads Gradle 8.7, AGP 8.5 and Kotlin 1.9 automatically.
+2. Plug in your phone (USB debugging on) and press ▶ Run. Min Android version: 8.0.
+
+## First-time setup on the phone
+1. Open AutoTouch → **Open Accessibility settings** → Installed apps / Downloaded apps →
+   **AutoTouch automation** → turn ON.
+   - Android 13+ shows "Restricted setting" for sideloaded apps. Fix: Settings ▸ Apps ▸
+     AutoTouch ▸ ⋮ menu (top right) ▸ **Allow restricted settings**, then try again.
+2. Back in AutoTouch, write your script → **Save & show floating panel**.
+3. Open the target app, press **▶ Run** on the panel. Drag the panel by its title.
+
+## Panel buttons
+- **▶ Run / ■ Stop** – run the saved script (loops and step delay come from the main screen)
+- **📍 Pick** – tap anywhere; adds `tap X Y` to the end of your script
+- **✕** – hide the panel (also stops a running macro)
+
+## Commands
+See the help text at the bottom of the main screen, or `MacroParser.kt`.
+
+## Notes
+- Prefer `click TEXT` / `focus TEXT` over coordinates – they survive layout changes.
+  `click` waits up to 3 s for the element to appear.
+- `type` sets the field's text directly (instant, works with any keyboard). Use
+  `typeslow` for apps that check each keystroke (search-as-you-type boxes).
+- Keep the panel away from spots your script taps – a tap on the panel hits the panel.
+- Games and some banking apps block accessibility input or draw without views;
+  coordinates still work in most games, text-based commands won't.
+
+## Automatic APK builds (GitHub Actions)
+Every push to `main` builds the app on GitHub's servers. Get the APK from
+**Releases ▸ AutoTouch (latest build) ▸ AutoTouch.apk** – you can open that link
+straight from your phone. You can also start a build by hand from **Actions ▸ Build APK ▸ Run workflow**.
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/build.gradle.kts
+====================================================================================================
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+
+android {
+    namespace = "com.autotouch.app"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.autotouch.app"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/AndroidManifest.xml
+====================================================================================================
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:icon="@android:drawable/ic_menu_manage"
+        android:theme="@style/Theme.AutoTouch">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".AutoService"
+            android:exported="true"
+            android:label="@string/service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
+    </application>
+</manifest>
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/java/com/autotouch/app/AutoService.kt
+====================================================================================================
+package com.autotouch.app
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.content.Intent
+import android.graphics.Path
+import android.graphics.Rect
+import android.os.Build
+import android.os.Bundle
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+
+/**
+ * The engine. Android only lets an app touch/type into OTHER apps through an
+ * Accessibility Service, which the user must switch on in Settings.
+ */
+class AutoService : AccessibilityService() {
+
+    companion object {
+        /** Non-null while the service is enabled and connected. */
+        var instance: AutoService? = null
+            private set
+    }
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var job: Job? = null
+    private lateinit var overlay: OverlayController
+
+    val isRunning: Boolean get() = job?.isActive == true
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+        overlay = OverlayController(this)
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) { /* not needed */ }
+
+    override fun onInterrupt() = stopMacro()
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        cleanup()
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        cleanup()
+        super.onDestroy()
+    }
+
+    private fun cleanup() {
+        stopMacro()
+        if (::overlay.isInitialized) overlay.hide()
+        instance = null
+    }
+
+    // ---------------------------------------------------------------- panel
+
+    fun showPanel() = overlay.show()
+    fun hidePanel() = overlay.hide()
+
+    // ---------------------------------------------------------------- running
+
+    /** loops <= 0 means repeat until Stop is pressed. */
+    fun runMacro(script: String, loops: Int, stepDelay: Long) {
+        if (isRunning) return
+        val steps = try {
+            MacroParser.parse(script)
+        } catch (e: MacroParser.ParseError) {
+            overlay.setStatus("⚠ ${e.message}")
+            return
+        }
+        overlay.setRunning(true)
+        job = scope.launch {
+            try {
+                val total = if (loops <= 0) Int.MAX_VALUE else loops
+                var failures = 0
+                for (loop in 1..total) {
+                    for (step in steps) {
+                        ensureActive()
+                        val loopLabel = if (loops <= 0) "Loop $loop" else "Loop $loop/$loops"
+                        overlay.setStatus("$loopLabel · ${step.label}")
+                        if (!execute(step)) {
+                            failures++
+                            overlay.setStatus("✗ Failed: ${step.label}")
+                            delay(600)
+                        }
+                        delay(stepDelay)
+                    }
+                }
+                overlay.setStatus(if (failures == 0) "✓ Done" else "Done with $failures failed step(s)")
+            } catch (e: CancellationException) {
+                overlay.setStatus("■ Stopped")
+                throw e
+            } finally {
+                overlay.setRunning(false)
+            }
+        }
+    }
+
+    fun stopMacro() {
+        job?.cancel()
+        job = null
+    }
+
+    private suspend fun execute(step: Step): Boolean = when (step) {
+        is Step.Tap -> tap(step.x, step.y)
+        is Step.DoubleTap -> tap(step.x, step.y).also { delay(90) } && tap(step.x, step.y)
+        is Step.LongPress -> gesture(pointPath(step.x, step.y), step.ms)
+        is Step.Swipe -> gesture(Path().apply {
+            moveTo(step.x1, step.y1); lineTo(step.x2, step.y2)
+        }, step.ms)
+        is Step.Wait -> { delay(step.ms); true }
+        is Step.Type -> setText(step.text, append = false)
+        is Step.Append -> setText(step.text, append = true)
+        is Step.TypeSlow -> typeSlow(step.text, step.charDelay)
+        is Step.Clear -> setText("", append = false)
+        is Step.Click -> clickElement(step.query)
+        is Step.Focus -> focusField(step.query)
+        is Step.Enter -> pressEnter()
+        is Step.Global -> performGlobalAction(step.action)
+    }
+
+    // ---------------------------------------------------------------- touch
+
+    private fun pointPath(x: Float, y: Float) = Path().apply { moveTo(x, y) }
+
+    suspend fun tap(x: Float, y: Float) = gesture(pointPath(x, y), 50)
+
+    private suspend fun gesture(path: Path, durationMs: Long): Boolean =
+        suspendCancellableCoroutine { cont ->
+            val duration = durationMs.coerceIn(1, GestureDescription.getMaxGestureDuration())
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, duration))
+                .build()
+            val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(g: GestureDescription?) { if (cont.isActive) cont.resume(true) }
+                override fun onCancelled(g: GestureDescription?) { if (cont.isActive) cont.resume(false) }
+            }, null)
+            if (!accepted && cont.isActive) cont.resume(false)
+        }
+
+    // ---------------------------------------------------------------- typing
+
+    private fun focusedInput(): AccessibilityNodeInfo? =
+        rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+
+    private fun setText(text: String, append: Boolean, node: AccessibilityNodeInfo? = focusedInput()): Boolean {
+        val target = node ?: return false
+        val existing = if (append && !target.isShowingHintText) target.text?.toString().orEmpty() else ""
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, existing + text)
+        }
+        return target.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    /** Types character by character so apps that react to each keystroke still work. */
+    private suspend fun typeSlow(text: String, charDelay: Long): Boolean {
+        val node = focusedInput() ?: return false
+        val start = if (node.isShowingHintText) "" else node.text?.toString().orEmpty()
+        val sb = StringBuilder(start)
+        for (c in text) {
+            sb.append(c)
+            node.refresh()
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, sb.toString())
+            }
+            if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
+            delay(charDelay)
+        }
+        return true
+    }
+
+    private fun pressEnter(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        val node = focusedInput() ?: return false
+        return node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+    }
+
+    // ---------------------------------------------------------------- finding elements
+
+    /** Waits up to [timeoutMs] for an element to appear on screen. */
+    private suspend fun waitForNode(query: String, editableOnly: Boolean, timeoutMs: Long = 3000): AccessibilityNodeInfo? {
+        val until = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            findNode(query, editableOnly)?.let { return it }
+            if (System.currentTimeMillis() > until) return null
+            delay(250)
+        }
+    }
+
+    private fun findNode(query: String, editableOnly: Boolean): AccessibilityNodeInfo? {
+        val q = query.trim().lowercase()
+        val roots = windows.mapNotNull { it.root }.ifEmpty { listOfNotNull(rootInActiveWindow) }
+            .filter { it.packageName != packageName } // never match our own panel
+
+        var partial: AccessibilityNodeInfo? = null
+        for (root in roots) {
+            val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            while (queue.isNotEmpty()) {
+                val n = queue.removeFirst()
+                for (i in 0 until n.childCount) n.getChild(i)?.let(queue::add)
+                if (editableOnly && !n.isEditable) continue
+                if (!n.isVisibleToUser) continue
+
+                val candidates = listOfNotNull(
+                    n.text?.toString(),
+                    n.contentDescription?.toString(),
+                    n.hintText?.toString(),
+                    n.viewIdResourceName?.substringAfter(":id/"),
+                ).map { it.trim().lowercase() }
+
+                if (candidates.any { it == q }) return n          // exact match wins
+                if (partial == null && candidates.any { it.contains(q) }) partial = n
+            }
+        }
+        return partial
+    }
+
+    private suspend fun clickElement(query: String): Boolean {
+        val node = waitForNode(query, editableOnly = false) ?: return false
+        // Text labels are often inside a clickable parent (e.g. a button row).
+        var target: AccessibilityNodeInfo? = node
+        while (target != null && !target.isClickable) target = target.parent
+        if (target != null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+        // Fallback: physically tap the centre of the element.
+        val r = Rect().also(node::getBoundsInScreen)
+        return tap(r.exactCenterX(), r.exactCenterY())
+    }
+
+    private suspend fun focusField(query: String): Boolean {
+        val node = waitForNode(query, editableOnly = true) ?: return false
+        if (node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK) // brings up the keyboard in most apps
+            return true
+        }
+        val r = Rect().also(node::getBoundsInScreen)
+        return tap(r.exactCenterX(), r.exactCenterY())
+    }
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/java/com/autotouch/app/MacroParser.kt
+====================================================================================================
+package com.autotouch.app
+
+import android.accessibilityservice.AccessibilityService
+
+/** One action in a macro script. */
+sealed class Step(val label: String) {
+    class Tap(val x: Float, val y: Float) : Step("tap ${x.toInt()},${y.toInt()}")
+    class DoubleTap(val x: Float, val y: Float) : Step("doubletap ${x.toInt()},${y.toInt()}")
+    class LongPress(val x: Float, val y: Float, val ms: Long) : Step("longpress ${x.toInt()},${y.toInt()}")
+    class Swipe(val x1: Float, val y1: Float, val x2: Float, val y2: Float, val ms: Long) :
+        Step("swipe ${x1.toInt()},${y1.toInt()} → ${x2.toInt()},${y2.toInt()}")
+    class Wait(val ms: Long) : Step("wait ${ms}ms")
+    class Type(val text: String) : Step("type \"${text.take(20)}\"")
+    class Append(val text: String) : Step("append \"${text.take(20)}\"")
+    class TypeSlow(val charDelay: Long, val text: String) : Step("typeslow \"${text.take(20)}\"")
+    class Clear : Step("clear")
+    class Click(val query: String) : Step("click \"$query\"")
+    class Focus(val query: String) : Step("focus \"$query\"")
+    class Enter : Step("enter")
+    class Global(val action: Int, name: String) : Step(name)
+}
+
+/**
+ * Parses a plain-text macro script. One command per line; lines starting with # are comments.
+ *
+ *   tap X Y                     single tap at screen coordinates
+ *   doubletap X Y
+ *   longpress X Y [ms]          default 800 ms
+ *   swipe X1 Y1 X2 Y2 [ms]      default 300 ms
+ *   wait MS
+ *   type TEXT                   replace text in the focused input field
+ *   append TEXT                 add to the end of the focused field
+ *   typeslow MS TEXT            type one character at a time, MS between characters
+ *   clear                       empty the focused field
+ *   click TEXT                  click the element whose text/description/hint/id matches
+ *   focus TEXT                  focus the input field matching TEXT (text, hint or id)
+ *   enter                       press the keyboard's Enter/Send/Search action (Android 11+)
+ *   back | home | recents | notifications
+ */
+object MacroParser {
+    class ParseError(msg: String) : Exception(msg)
+
+    fun parse(script: String): List<Step> {
+        val steps = mutableListOf<Step>()
+        script.lines().forEachIndexed { index, raw ->
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#")) return@forEachIndexed
+            val lineNo = index + 1
+            val cmd = line.substringBefore(' ').lowercase()
+            val rest = line.substringAfter(' ', "").trim()
+
+            fun nums(min: Int): List<Float> {
+                val parts = rest.split(Regex("\\s+")).filter { it.isNotEmpty() }
+                val values = parts.map {
+                    it.toFloatOrNull() ?: throw ParseError("Line $lineNo: '$it' is not a number")
+                }
+                if (values.size < min) throw ParseError("Line $lineNo: '$cmd' needs at least $min numbers")
+                values.forEach { if (it < 0) throw ParseError("Line $lineNo: coordinates can't be negative") }
+                return values
+            }
+
+            fun text(): String {
+                if (rest.isEmpty()) throw ParseError("Line $lineNo: '$cmd' needs some text")
+                return unquote(rest)
+            }
+
+            steps += when (cmd) {
+                "tap" -> nums(2).let { Step.Tap(it[0], it[1]) }
+                "doubletap" -> nums(2).let { Step.DoubleTap(it[0], it[1]) }
+                "longpress" -> nums(2).let { Step.LongPress(it[0], it[1], it.getOrNull(2)?.toLong() ?: 800L) }
+                "swipe" -> nums(4).let { Step.Swipe(it[0], it[1], it[2], it[3], it.getOrNull(4)?.toLong() ?: 300L) }
+                "wait", "sleep", "delay" -> nums(1).let { Step.Wait(it[0].toLong()) }
+                "type" -> Step.Type(text())
+                "append" -> Step.Append(text())
+                "typeslow" -> {
+                    val delayPart = rest.substringBefore(' ')
+                    val ms = delayPart.toLongOrNull()
+                        ?: throw ParseError("Line $lineNo: use 'typeslow MS TEXT', e.g. typeslow 80 Hello")
+                    val t = rest.substringAfter(' ', "").trim()
+                    if (t.isEmpty()) throw ParseError("Line $lineNo: 'typeslow' needs some text")
+                    Step.TypeSlow(ms, unquote(t))
+                }
+                "clear" -> Step.Clear()
+                "click" -> Step.Click(text())
+                "focus" -> Step.Focus(text())
+                "enter" -> Step.Enter()
+                "back" -> Step.Global(AccessibilityService.GLOBAL_ACTION_BACK, "back")
+                "home" -> Step.Global(AccessibilityService.GLOBAL_ACTION_HOME, "home")
+                "recents" -> Step.Global(AccessibilityService.GLOBAL_ACTION_RECENTS, "recents")
+                "notifications" -> Step.Global(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "notifications")
+                else -> throw ParseError("Line $lineNo: unknown command '$cmd'")
+            }
+        }
+        if (steps.isEmpty()) throw ParseError("Script has no commands")
+        return steps
+    }
+
+    private fun unquote(s: String): String =
+        if (s.length >= 2 && s.first() == '"' && s.last() == '"') s.substring(1, s.length - 1) else s
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/java/com/autotouch/app/MainActivity.kt
+====================================================================================================
+package com.autotouch.app
+
+import android.content.Intent
+import android.graphics.Color
+import android.os.Bundle
+import android.provider.Settings
+import android.widget.Button
+import android.widget.EditText
+import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var scriptInput: EditText
+    private lateinit var loopsInput: EditText
+    private lateinit var delayInput: EditText
+    private lateinit var serviceStatus: TextView
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        scriptInput = findViewById(R.id.scriptInput)
+        loopsInput = findViewById(R.id.loopsInput)
+        delayInput = findViewById(R.id.delayInput)
+        serviceStatus = findViewById(R.id.serviceStatus)
+        findViewById<TextView>(R.id.helpText).text = HELP
+
+        findViewById<Button>(R.id.btnEnable).setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+
+        findViewById<Button>(R.id.btnSave).setOnClickListener {
+            if (save()) Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+        }
+
+        findViewById<Button>(R.id.btnPanel).setOnClickListener {
+            if (!save()) return@setOnClickListener
+            val service = AutoService.instance
+            if (service == null) {
+                Toast.makeText(this, "Turn on the AutoTouch accessibility service first", Toast.LENGTH_LONG).show()
+                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+            } else {
+                service.showPanel()
+                Toast.makeText(this, "Panel shown – open the app you want to automate", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Reload in case the 📍 Pick button appended new lines while we were away.
+        scriptInput.setText(ScriptStore.script(this))
+        loopsInput.setText(ScriptStore.loops(this).toString())
+        delayInput.setText(ScriptStore.stepDelay(this).toString())
+        updateServiceStatus()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        save(quiet = true)
+    }
+
+    private fun updateServiceStatus() {
+        val on = AutoService.instance != null
+        serviceStatus.text = if (on) "● Accessibility service is ON" else "○ Accessibility service is OFF – tap the button below and enable \"AutoTouch automation\""
+        serviceStatus.setBackgroundColor(if (on) 0x331E8E3E else 0x33D93025)
+        serviceStatus.setTextColor(if (on) Color.rgb(30, 142, 62) else Color.rgb(217, 48, 37))
+    }
+
+    /** Validates and saves. Returns false (and shows the error) if the script is invalid. */
+    private fun save(quiet: Boolean = false): Boolean {
+        val script = scriptInput.text.toString()
+        val loops = loopsInput.text.toString().toIntOrNull()?.coerceAtLeast(0) ?: 1
+        val delay = delayInput.text.toString().toLongOrNull()?.coerceAtLeast(0) ?: 300L
+        if (!quiet) {
+            try {
+                MacroParser.parse(script)
+            } catch (e: MacroParser.ParseError) {
+                Toast.makeText(this, e.message, Toast.LENGTH_LONG).show()
+                return false
+            }
+        }
+        ScriptStore.save(this, script, loops, delay)
+        return true
+    }
+
+    private companion object {
+        val HELP = """
+            COMMANDS (one per line, # = comment)
+
+            tap X Y               tap a point
+            doubletap X Y
+            longpress X Y [MS]    default 800
+            swipe X1 Y1 X2 Y2 [MS] default 300
+            wait MS               pause
+
+            type TEXT             replace text in focused field
+            append TEXT           add to focused field
+            typeslow MS TEXT      type char by char
+            clear                 empty focused field
+            enter                 keyboard Enter/Send (Android 11+)
+
+            click TEXT            click a button/element by its
+                                  text, description, hint or id
+            focus TEXT            focus an input field by its
+                                  text, hint or id
+
+            back | home | recents | notifications
+
+            EXAMPLE – send a chat message
+            click Search
+            focus Search
+            type Juan
+            wait 1000
+            click Juan dela Cruz
+            focus Message
+            type Good morning!
+            click Send
+
+            Tips: use 📍 Pick on the floating panel to grab
+            coordinates. Or turn on Developer options ▸
+            Pointer location to see X/Y while you touch.
+        """.trimIndent()
+    }
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/java/com/autotouch/app/OverlayController.kt
+====================================================================================================
+package com.autotouch.app
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+
+/**
+ * Small draggable control panel that floats over every app.
+ * Uses TYPE_ACCESSIBILITY_OVERLAY, so no extra "draw over other apps" permission is needed.
+ */
+class OverlayController(private val service: AutoService) {
+
+    private val wm = service.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val density = service.resources.displayMetrics.density
+    private fun dp(v: Int) = (v * density).toInt()
+
+    private var panel: View? = null
+    private var pickView: View? = null
+    private var statusView: TextView? = null
+    private var runButton: TextView? = null
+
+    private val panelParams = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+        PixelFormat.TRANSLUCENT
+    ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        x = dp(16)
+        y = dp(120)
+    }
+
+    @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
+    fun show() {
+        if (panel != null) return
+        val ctx: Context = service
+
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(10))
+            background = GradientDrawable().apply {
+                setColor(0xEE202124.toInt())
+                cornerRadius = dp(14).toFloat()
+            }
+        }
+
+        val title = TextView(ctx).apply {
+            text = "⠿  AutoTouch"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(2), 0, dp(2))
+        }
+
+        val status = TextView(ctx).apply {
+            text = "Ready"
+            setTextColor(0xFFBDC1C6.toInt())
+            textSize = 12f
+            maxWidth = dp(230)
+            maxLines = 2
+        }
+
+        val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+
+        fun button(label: String, color: Int, onClick: () -> Unit) = TextView(ctx).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = GradientDrawable().apply {
+                setColor(color)
+                cornerRadius = dp(8).toFloat()
+            }
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = dp(6); topMargin = dp(8) }
+        }
+
+        val run = button("▶ Run", GREEN) { toggleRun() }
+        row.addView(run)
+        row.addView(button("📍 Pick", BLUE) { startPick() })
+        row.addView(button("✕", GREY) { hide() })
+
+        root.addView(title)
+        root.addView(status)
+        root.addView(row)
+
+        // Drag the panel by its title bar.
+        var startX = 0; var startY = 0; var touchX = 0f; var touchY = 0f
+        title.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    startX = panelParams.x; startY = panelParams.y
+                    touchX = e.rawX; touchY = e.rawY
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    panelParams.x = startX + (e.rawX - touchX).toInt()
+                    panelParams.y = startY + (e.rawY - touchY).toInt()
+                    wm.updateViewLayout(root, panelParams)
+                    true
+                }
+                else -> false
+            }
+        }
+
+        wm.addView(root, panelParams)
+        panel = root
+        statusView = status
+        runButton = run
+        setRunning(service.isRunning)
+    }
+
+    fun hide() {
+        service.stopMacro()
+        removePick()
+        panel?.let { runCatching { wm.removeView(it) } }
+        panel = null
+        statusView = null
+        runButton = null
+    }
+
+    fun setStatus(text: String) {
+        statusView?.text = text
+    }
+
+    fun setRunning(running: Boolean) {
+        runButton?.apply {
+            text = if (running) "■ Stop" else "▶ Run"
+            (background as? GradientDrawable)?.setColor(if (running) RED else GREEN)
+        }
+    }
+
+    private fun toggleRun() {
+        if (service.isRunning) {
+            service.stopMacro()
+        } else {
+            removePick()
+            service.runMacro(
+                ScriptStore.script(service),
+                ScriptStore.loops(service),
+                ScriptStore.stepDelay(service)
+            )
+        }
+    }
+
+    /** Full-screen catcher: the next touch anywhere becomes a "tap X Y" line in the script. */
+    @SuppressLint("ClickableViewAccessibility", "SetTextI18n")
+    private fun startPick() {
+        if (pickView != null || service.isRunning) return
+        val catcher = TextView(service).apply {
+            text = "Tap anywhere to capture its coordinates"
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setBackgroundColor(0x441A73E8)
+            setOnTouchListener { _, e ->
+                if (e.action == MotionEvent.ACTION_DOWN) {
+                    val x = e.rawX.toInt()
+                    val y = e.rawY.toInt()
+                    ScriptStore.appendLine(service, "tap $x $y")
+                    setStatus("Added: tap $x $y")
+                    Toast.makeText(service, "Added: tap $x $y", Toast.LENGTH_SHORT).show()
+                    removePick()
+                }
+                true
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        wm.addView(catcher, params)
+        pickView = catcher
+        setStatus("Pick mode: tap a spot…")
+    }
+
+    private fun removePick() {
+        pickView?.let { runCatching { wm.removeView(it) } }
+        pickView = null
+    }
+
+    private companion object {
+        const val GREEN = 0xFF1E8E3E.toInt()
+        const val BLUE = 0xFF1A73E8.toInt()
+        const val RED = 0xFFD93025.toInt()
+        const val GREY = 0xFF5F6368.toInt()
+    }
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/java/com/autotouch/app/ScriptStore.kt
+====================================================================================================
+package com.autotouch.app
+
+import android.content.Context
+
+/** Saves the script and run settings so the app and the floating panel share them. */
+object ScriptStore {
+    private const val PREFS = "autotouch"
+
+    val DEFAULT_SCRIPT = """
+        # AutoTouch script – one command per line
+        # Use the 📍 Pick button on the floating panel to grab tap coordinates.
+        wait 1000
+        tap 540 1200
+        type Hello from AutoTouch!
+        enter
+    """.trimIndent()
+
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    fun script(ctx: Context): String = prefs(ctx).getString("script", null) ?: DEFAULT_SCRIPT
+    fun loops(ctx: Context): Int = prefs(ctx).getInt("loops", 1)
+    fun stepDelay(ctx: Context): Long = prefs(ctx).getLong("stepDelay", 300L)
+
+    fun save(ctx: Context, script: String, loops: Int, stepDelay: Long) {
+        prefs(ctx).edit()
+            .putString("script", script)
+            .putInt("loops", loops)
+            .putLong("stepDelay", stepDelay)
+            .apply()
+    }
+
+    fun appendLine(ctx: Context, line: String) {
+        val current = script(ctx).trimEnd()
+        prefs(ctx).edit().putString("script", "$current\n$line").apply()
+    }
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/res/layout/activity_main.xml
+====================================================================================================
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:id="@+id/serviceStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="12dp"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnEnable"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Open Accessibility settings" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Macro script"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/scriptInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:gravity="top|start"
+            android:inputType="textMultiLine|textNoSuggestions"
+            android:minLines="10"
+            android:textSize="14sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Loops (0 = forever)" />
+
+                <EditText
+                    android:id="@+id/loopsInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="number" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Delay between steps (ms)" />
+
+                <EditText
+                    android:id="@+id/delayInput"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="number" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/btnSave"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Save script" />
+
+        <Button
+            android:id="@+id/btnPanel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Save &amp; show floating panel" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Practice field (try: focus practice, then type hello)"
+            android:textStyle="bold" />
+
+        <EditText
+            android:id="@+id/practiceField"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="practice"
+            android:inputType="text" />
+
+        <TextView
+            android:id="@+id/helpText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:fontFamily="monospace"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </LinearLayout>
+</ScrollView>
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/res/values/strings.xml
+====================================================================================================
+<resources>
+    <string name="app_name">AutoTouch</string>
+    <string name="service_label">AutoTouch automation</string>
+    <string name="service_description">Lets AutoTouch tap, swipe and type into other apps by running the macro script you write. It only acts when you press Run.</string>
+</resources>
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/res/values/themes.xml
+====================================================================================================
+<resources>
+    <style name="Theme.AutoTouch" parent="Theme.AppCompat.DayNight.DarkActionBar">
+        <item name="colorPrimary">#1A73E8</item>
+        <item name="colorPrimaryDark">#1557B0</item>
+        <item name="colorAccent">#1E8E3E</item>
+    </style>
+</resources>
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/app/src/main/res/xml/accessibility_config.xml
+====================================================================================================
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/service_description"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews|flagRetrieveInteractiveWindows"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="100" />
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/build.gradle.kts
+====================================================================================================
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/gradle.properties
+====================================================================================================
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/gradle/wrapper/gradle-wrapper.properties
+====================================================================================================
+distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/gradlew.bat
+====================================================================================================
+@rem
+@rem Copyright 2015 the original author or authors.
+@rem
+@rem Licensed under the Apache License, Version 2.0 (the "License");
+@rem you may not use this file except in compliance with the License.
+@rem You may obtain a copy of the License at
+@rem
+@rem      https://www.apache.org/licenses/LICENSE-2.0
+@rem
+@rem Unless required by applicable law or agreed to in writing, software
+@rem distributed under the License is distributed on an "AS IS" BASIS,
+@rem WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+@rem See the License for the specific language governing permissions and
+@rem limitations under the License.
+@rem
+@rem SPDX-License-Identifier: Apache-2.0
+@rem
+
+@if "%DEBUG%"=="" @echo off
+@rem ##########################################################################
+@rem
+@rem  Gradle startup script for Windows
+@rem
+@rem ##########################################################################
+
+@rem Set local scope for the variables with windows NT shell
+if "%OS%"=="Windows_NT" setlocal
+
+set DIRNAME=%~dp0
+if "%DIRNAME%"=="" set DIRNAME=.
+@rem This is normally unused
+set APP_BASE_NAME=%~n0
+set APP_HOME=%DIRNAME%
+
+@rem Resolve any "." and ".." in APP_HOME to make it shorter.
+for %%i in ("%APP_HOME%") do set APP_HOME=%%~fi
+
+@rem Add default JVM options here. You can also use JAVA_OPTS and GRADLE_OPTS to pass JVM options to this script.
+set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m"
+
+@rem Find java.exe
+if defined JAVA_HOME goto findJavaFromJavaHome
+
+set JAVA_EXE=java.exe
+%JAVA_EXE% -version >NUL 2>&1
+if %ERRORLEVEL% equ 0 goto execute
+
+echo. 1>&2
+echo ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH. 1>&2
+echo. 1>&2
+echo Please set the JAVA_HOME variable in your environment to match the 1>&2
+echo location of your Java installation. 1>&2
+
+goto fail
+
+:findJavaFromJavaHome
+set JAVA_HOME=%JAVA_HOME:"=%
+set JAVA_EXE=%JAVA_HOME%/bin/java.exe
+
+if exist "%JAVA_EXE%" goto execute
+
+echo. 1>&2
+echo ERROR: JAVA_HOME is set to an invalid directory: %JAVA_HOME% 1>&2
+echo. 1>&2
+echo Please set the JAVA_HOME variable in your environment to match the 1>&2
+echo location of your Java installation. 1>&2
+
+goto fail
+
+:execute
+@rem Setup the command line
+
+set CLASSPATH=
+
+
+@rem Execute Gradle
+"%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -classpath "%CLASSPATH%" -jar "%APP_HOME%\gradle\wrapper\gradle-wrapper.jar" %*
+
+:end
+@rem End local scope for the variables with windows NT shell
+if %ERRORLEVEL% equ 0 goto mainEnd
+
+:fail
+rem Set variable GRADLE_EXIT_CONSOLE if you need the _script_ return code instead of
+rem the _cmd.exe /c_ return code!
+set EXIT_CODE=%ERRORLEVEL%
+if %EXIT_CODE% equ 0 set EXIT_CODE=1
+if not ""=="%GRADLE_EXIT_CONSOLE%" exit %EXIT_CODE%
+exit /b %EXIT_CODE%
+
+:mainEnd
+if "%OS%"=="Windows_NT" endlocal
+
+:omega
+
+====================================================================================================
+FILE PATH: AutoTouch-latest/settings.gradle.kts
+====================================================================================================
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = "AutoTouch"
+include(":app")

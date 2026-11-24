@@ -1,0 +1,439 @@
+package com.example.ui.screens
+
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccessibilityNew
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.TouchApp
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import com.example.ui.components.BmButton
+import com.example.ui.components.BmButtonKind
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import com.example.data.engine.EngineUiState
+import com.example.data.engine.StakeCalculator
+import com.example.data.model.RoundRecord
+import com.example.data.model.StrategyConfig
+import com.example.ui.theme.CoralDanger
+import com.example.ui.theme.EmeraldPrimary
+import com.example.ui.theme.GoldAccent
+import com.example.ui.theme.MonoFontFamily
+
+@Composable
+fun SimpleHomeScreen(
+    engineState: EngineUiState,
+    config: StrategyConfig,
+    lastFiveResults: List<RoundRecord>,
+    todayProfit: Double,
+    onToggleStartStop: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit,
+    onToggleFloatingHand: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val statusColor by animateColorAsState(
+        targetValue = when {
+            !engineState.serviceConnected -> CoralDanger
+            engineState.isRunning -> EmeraldPrimary
+            else -> GoldAccent
+        },
+        label = "statusColor"
+    )
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .widthIn(max = 600.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "BetManager",
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            text = "${engineState.gameName} · ${engineState.siteUrl}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Surface(
+                        color = statusColor.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(statusColor)
+                            )
+                            Text(
+                                text = when {
+                                    !engineState.serviceConnected -> "Service Off"
+                                    engineState.isRunning -> "Active"
+                                    else -> "Ready"
+                                },
+                                style = MaterialTheme.typography.labelLarge,
+                                color = statusColor
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (!engineState.serviceConnected) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f)
+                        ),
+                        border = BorderStroke(1.dp, CoralDanger.copy(alpha = 0.45f))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.AccessibilityNew,
+                                    contentDescription = "Accessibility required",
+                                    tint = CoralDanger
+                                )
+                                Text(
+                                    text = "Enable BetManager Automation",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Text(
+                                text = "Turn on BetManager Automation in Android Accessibility Settings so BetManager can read game state and tap verified bets.",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            BmButton(
+                                text = "Open Accessibility Settings",
+                                onClick = onOpenAccessibilitySettings,
+                                kind = BmButtonKind.SOFT,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("enable_accessibility_button")
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Primary Start/Stop & Status Card
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Text(
+                            text = "LIVE STATUS",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = engineState.statusLine,
+                            style = MaterialTheme.typography.titleLarge,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("home_status_line")
+                        )
+
+                        BmButton(
+                            text = if (engineState.isRunning) "Stop BetManager" else "Start BetManager",
+                            onClick = onToggleStartStop,
+                            kind = if (engineState.isRunning) BmButtonKind.STOP else BmButtonKind.GO,
+                            icon = if (engineState.isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("start_stop_button")
+                        )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.TouchApp,
+                                    contentDescription = "Floating panel",
+                                    tint = EmeraldPrimary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Text(
+                                    text = "Floating BetManager panel",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            Switch(
+                                checked = config.showFloatingHand,
+                                onCheckedChange = onToggleFloatingHand,
+                                modifier = Modifier.testTag("floating_hand_toggle")
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Telemetry Metrics Grid
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    MetricTile(
+                        label = "CURRENT STAKE",
+                        value = "${StakeCalculator.formatStake(engineState.currentStake)} ${engineState.currency}",
+                        subtitle = if (engineState.consecutiveLosses > 0) {
+                            "${engineState.consecutiveLosses} loss streak"
+                        } else {
+                            "Target ${StakeCalculator.formatStake(config.cashOutTarget)}x"
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    MetricTile(
+                        label = "TODAY'S PROFIT",
+                        value = formatSignedProfit(todayProfit, engineState.currency),
+                        subtitle = if (config.useGameAutoCashOut) "Game Auto Cash Out" else "Manual target",
+                        accentColor = if (todayProfit >= 0.0) EmeraldPrimary else CoralDanger,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    MetricTile(
+                        label = "BALANCE",
+                        value = engineState.balance?.let {
+                            "${StakeCalculator.formatStake(it)} ${engineState.currency}"
+                        } ?: "Not visible",
+                        subtitle = if (config.balanceFloor > 0.0) {
+                            "Floor ${StakeCalculator.formatStake(config.balanceFloor)}"
+                        } else {
+                            "Non-blocking read"
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    MetricTile(
+                        label = "GAME & SITE",
+                        value = engineState.gameName,
+                        subtitle = engineState.siteUrl,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            // Last 5 Results
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            text = "LAST 5 RESULTS",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (lastFiveResults.isEmpty()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Info,
+                                    contentDescription = "No results yet",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = "No bets settled yet. Placed bets and crash results will appear here.",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        } else {
+                            lastFiveResults.forEach { record ->
+                                val isWin = record.won == true
+                                val badgeColor = if (isWin) EmeraldPrimary else CoralDanger
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.CheckCircle,
+                                            contentDescription = if (isWin) "Win" else "Loss",
+                                            tint = badgeColor,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Column {
+                                            Text(
+                                                text = if (isWin) "WIN" else "LOSS",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = badgeColor
+                                            )
+                                            Text(
+                                                text = "Crash ${StakeCalculator.formatStake(record.crashMultiplier)}x · Stake ${StakeCalculator.formatStake(record.stakePlaced ?: 0.0)}",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = formatSignedProfit(record.profitDelta, engineState.currency),
+                                        fontFamily = MonoFontFamily,
+                                        fontWeight = FontWeight.Bold,
+                                        color = badgeColor
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricTile(
+    label: String,
+    value: String,
+    subtitle: String,
+    modifier: Modifier = Modifier,
+    accentColor: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.onSurface
+) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = value,
+                fontFamily = MonoFontFamily,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.titleLarge,
+                color = accentColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+private fun formatSignedProfit(amount: Double, currency: String): String {
+    val prefix = if (amount >= 0.0) "+" else "-"
+    return "$prefix${StakeCalculator.formatStake(kotlin.math.abs(amount))} $currency"
+}
