@@ -1,0 +1,496 @@
+package com.example
+
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.example.data.engine.AutomationEngine
+import com.example.data.engine.PatternDetectionEngine
+import com.example.data.local.BetManagerDatabase
+import com.example.data.local.BetManagerRepository
+import com.example.data.model.AfterLossMode
+import com.example.data.model.BettingMode
+import com.example.data.model.CalendarHourUtils
+import com.example.data.model.ColorClassifier
+import com.example.data.model.ColorMatchDirection
+import com.example.data.model.CrashColorCategory
+import com.example.data.model.CrashRecord
+import com.example.data.model.CustomPatternStrategy
+import com.example.data.model.MultiplierRecord
+import com.example.data.model.MultiplierRuleSubtype
+import com.example.data.model.PatternComparator
+import com.example.data.model.PatternCondition
+import com.example.data.model.PatternLogicOperator
+import com.example.data.model.StakeProgressionMode
+import com.example.data.model.StrategyConfig
+import com.example.data.model.StrategyGroup
+import com.example.data.model.StrategyMode
+import com.example.data.model.StrategyNotificationType
+import com.example.service.AutoTouchDriver
+import com.example.service.DriverPlatform
+import com.example.service.GamePhase
+import com.example.service.RectBounds
+import com.example.service.ScanScheduler
+import com.example.service.ScreenMap
+import com.example.service.UiTarget
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+@OptIn(ExperimentalCoroutinesApi::class)
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
+class CustomStrategyIntegrationTest {
+
+    private class FakeTouchPlatform : DriverPlatform {
+        override val ownPackageName: String = "com.aistudio.betmanager.rtxpvw"
+        override val preferRealTouchGesture: Boolean = false
+
+        var currentStakeText: String = "20.00"
+        var hasCancelButton: Boolean = false
+        val clickedNodeIds = mutableListOf<String>()
+        var currentMap: ScreenMap = ScreenMap(
+            timestampMs = 1_000L,
+            packageName = "com.android.chrome",
+            gameName = "Aviator",
+            siteUrl = "BetPawa",
+            phase = GamePhase.BETTING_OPEN
+        )
+
+        override fun scanScreen(): ScreenMap = currentMap.copy(
+            cancelButton = if (hasCancelButton) {
+                UiTarget("cancel_btn", RectBounds(520, 1100, 980, 1240), text = "Cancel", isClickable = true)
+            } else {
+                null
+            },
+            stakeField = UiTarget("stake_input", RectBounds(140, 1120, 400, 1200), text = currentStakeText, isEditable = true),
+            betButton = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet $currentStakeText TZS", isClickable = true)
+        )
+
+        override fun findNode(query: String, editableOnly: Boolean): UiTarget? {
+            return if (editableOnly || query.contains("stake", ignoreCase = true)) {
+                UiTarget("stake_input", RectBounds(140, 1120, 400, 1200), text = currentStakeText, isEditable = true)
+            } else {
+                null
+            }
+        }
+
+        override fun findFocusedInput(): UiTarget? = null
+        override fun hasImeWindow(): Boolean = false
+
+        override fun performNodeClick(nodeId: String): Boolean {
+            clickedNodeIds += nodeId
+            if (nodeId == "bet_btn") {
+                hasCancelButton = true
+            }
+            return true
+        }
+
+        override fun performSetText(nodeId: String, text: String): Boolean {
+            currentStakeText = text
+            return true
+        }
+
+        override suspend fun dispatchTapGesture(x: Float, y: Float, durationMs: Long): Boolean = true
+        override fun performGlobalBack(): Boolean = true
+    }
+
+    private fun crashRecord(
+        id: Long,
+        mult: Double,
+        ts: Long,
+        gameId: String = "aviator",
+        colorHex: String? = null,
+        isPixelVerified: Boolean = false
+    ): CrashRecord {
+        val cat = if (colorHex != null) {
+            ColorClassifier.classifyHex(colorHex)
+        } else {
+            ColorClassifier.fallbackCategoryForMultiplier(mult, 2.00, 10.00)
+        }
+        return CrashRecord(
+            id = id,
+            gameId = gameId,
+            gameName = "Aviator",
+            multiplier = mult,
+            detectedColorHex = colorHex ?: cat.defaultHex,
+            colorCategory = cat,
+            isPixelColorVerified = isPixelVerified,
+            crashTimestamp = ts,
+            hourStartTimestamp = CalendarHourUtils.hourStartFor(ts),
+            dedupKey = CrashRecord.buildDedupKey(gameId, null, ts, mult, id.toInt())
+        )
+    }
+
+    @Test
+    fun `single-condition Pink and high multiplier rules trigger immediately on 1 matching round`() {
+        val engine = PatternDetectionEngine()
+        val now = 1_700_000_000_000L
+
+        val highMultStrategy = CustomPatternStrategy(
+            id = 1L,
+            name = "Single Pink >= 10x",
+            strategyGroup = StrategyGroup.MULTIPLIER_INTERVAL,
+            strategyMode = StrategyMode.STRATEGY_A_CONSECUTIVE_LOWS,
+            multiplierRuleSubtype = MultiplierRuleSubtype.BIG_MULTIPLIER
+        ).withConditions(
+            listOf(
+                PatternCondition(
+                    comparator = PatternComparator.GREATER_OR_EQUAL,
+                    threshold = 10.00,
+                    consecutiveRounds = 1
+                )
+            )
+        )
+
+        val invalidZeroStrategy = CustomPatternStrategy(
+            id = 3L,
+            name = "Invalid Zero Rounds",
+            strategyGroup = StrategyGroup.MULTIPLIER_INTERVAL,
+            strategyMode = StrategyMode.STRATEGY_A_CONSECUTIVE_LOWS
+        ).withConditions(
+            listOf(
+                PatternCondition(
+                    comparator = PatternComparator.GREATER_OR_EQUAL,
+                    threshold = 10.00,
+                    consecutiveRounds = 0
+                )
+            )
+        )
+
+        val singlePinkColorStrategy = CustomPatternStrategy(
+            id = 2L,
+            name = "Single Pink Color",
+            strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+            strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+            colorMatchDirection = ColorMatchDirection.HORIZONTAL,
+            colorSequenceCsv = CrashColorCategory.Pink.name
+        )
+
+        val records = listOf(crashRecord(1L, 10.00, now))
+        val batch = engine.evaluateStrategiesOnCrashRecords(
+            strategies = listOf(highMultStrategy, singlePinkColorStrategy, invalidZeroStrategy),
+            crashRecords = records,
+            nowMs = now
+        )
+
+        val reachedIds = batch.events
+            .filter { it.notificationType == StrategyNotificationType.STRATEGY_REACHED }
+            .map { it.strategy.id }
+            .toSet()
+
+        assertTrue("Expected strategy 1 (>=10.00x, 1 consec) to fire immediately", 1L in reachedIds)
+        assertTrue("Expected strategy 2 (single Pink) to fire immediately", 2L in reachedIds)
+        assertFalse("Expected strategy 3 (0 consec) NOT to coerce to 1", 3L in reachedIds)
+        assertEquals(2, batch.newOccurrences.size)
+    }
+
+    @Test
+    fun `above_then_below respects exact chronological order and inclusive bounds without extra trailing rounds`() {
+        val engine = PatternDetectionEngine()
+        val t0 = 1_700_000_000_000L
+
+        val exclusiveStrat = CustomPatternStrategy(
+            id = 10L,
+            name = "Above 2x then Below 2x (Exclusive)",
+            strategyGroup = StrategyGroup.MULTIPLIER_INTERVAL,
+            strategyMode = StrategyMode.STRATEGY_A_CONSECUTIVE_LOWS,
+            multiplierRuleSubtype = MultiplierRuleSubtype.ABOVE_THEN_BELOW,
+            aboveThresholdX = 2.00,
+            aboveConsecutiveCount = 1,
+            belowThresholdY = 2.00,
+            belowConsecutiveCount = 1,
+            inclusiveBounds = false
+        )
+
+        val inclusiveStrat = exclusiveStrat.copy(
+            id = 11L,
+            name = "AtOrAbove 2x then AtOrBelow 2x (Inclusive)",
+            inclusiveBounds = true
+        )
+
+        // Exact 2.00x followed by 1.50x: inclusive matches, exclusive does not
+        val exactBoundaryRecords = listOf(
+            crashRecord(1L, 2.00, t0),
+            crashRecord(2L, 1.50, t0 + 10_000L)
+        )
+        val batch1 = engine.evaluateStrategiesOnCrashRecords(
+            strategies = listOf(exclusiveStrat, inclusiveStrat),
+            crashRecords = exactBoundaryRecords,
+            nowMs = t0 + 10_000L
+        )
+        val reached1 = batch1.events.filter { it.notificationType == StrategyNotificationType.STRATEGY_REACHED }.map { it.strategy.id }
+        assertFalse(10L in reached1)
+        assertTrue(11L in reached1)
+
+        // Strictly > 2.00x followed by 1 strictly < 2.00x -> fires on the very first <2.00x round
+        val strictRecords = listOf(
+            crashRecord(1L, 1.20, t0),
+            crashRecord(2L, 2.45, t0 + 10_000L),
+            crashRecord(3L, 1.85, t0 + 20_000L)
+        )
+        val batch2 = engine.evaluateStrategiesOnCrashRecords(
+            strategies = listOf(exclusiveStrat),
+            crashRecords = strictRecords,
+            nowMs = t0 + 20_000L
+        )
+        assertTrue(batch2.events.any { it.strategy.id == 10L && it.notificationType == StrategyNotificationType.STRATEGY_REACHED })
+    }
+
+    @Test
+    fun `color picker HEX and vertical 8-col grid sequences match accurately`() {
+        val engine = PatternDetectionEngine()
+        val t0 = 1_700_000_000_000L
+
+        val customHexPink = ColorClassifier.normalizeHex("#FF1493")
+        val hexHorizontalStrat = CustomPatternStrategy(
+            id = 20L,
+            name = "Blue then Custom Pink HEX",
+            strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+            strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+            colorMatchDirection = ColorMatchDirection.HORIZONTAL,
+            colorSequenceCsv = "Blue,Pink",
+            customColorHexFilterCsv = "ANY,$customHexPink"
+        )
+
+        val recordsHorizontal = listOf(
+            crashRecord(1L, 1.40, t0),
+            crashRecord(2L, 12.50, t0 + 5_000L, colorHex = customHexPink, isPixelVerified = true)
+        )
+        val resHoriz = engine.evaluateStrategiesOnCrashRecords(listOf(hexHorizontalStrat), recordsHorizontal, nowMs = t0 + 5_000L)
+        assertTrue(resHoriz.events.any { it.strategy.id == 20L && it.notificationType == StrategyNotificationType.STRATEGY_REACHED })
+
+        // Vertical 8-column match: indices [0] and [8] are Pink while intermediates are Blue
+        val verticalStrat = CustomPatternStrategy(
+            id = 21L,
+            name = "Vertical 8-Col Pink Stack",
+            strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+            strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+            colorMatchDirection = ColorMatchDirection.VERTICAL,
+            gridColumnsForVertical = 8,
+            colorSequenceCsv = "Pink,Pink"
+        )
+        val gridRecords = (0..8).map { i ->
+            val mult = if (i == 0 || i == 8) 11.20 else 1.35
+            crashRecord(i.toLong() + 1L, mult, t0 + i * 5_000L)
+        }
+        val resVert = engine.evaluateStrategiesOnCrashRecords(listOf(verticalStrat), gridRecords, nowMs = t0 + 50_000L)
+        assertTrue(resVert.events.any { it.strategy.id == 21L && it.notificationType == StrategyNotificationType.STRATEGY_REACHED })
+    }
+
+    @Test
+    fun `time interval postBigWaitMinutes fires when elapsed minutes complete`() {
+        val engine = PatternDetectionEngine()
+        val tBig = 1_700_000_000_000L
+        val strat = CustomPatternStrategy(
+            id = 30L,
+            name = "Wait 5m after 10x",
+            strategyGroup = StrategyGroup.TIME_INTERVAL,
+            strategyMode = StrategyMode.STRATEGY_B_BIG_INTERVALS,
+            bigMultiplierThreshold = 10.00,
+            postBigWaitMinutes = 5,
+            requiredOccurrencesPerHour = 1,
+            analysisWindowMinutes = 60
+        )
+        val records = listOf(crashRecord(1L, 15.00, tBig))
+
+        val tooEarly = engine.evaluateTimeSchedulesTick(listOf(strat), records, nowMs = tBig + 4 * 60_000L)
+        assertTrue(tooEarly.events.isEmpty())
+
+        val elapsed = engine.evaluateTimeSchedulesTick(listOf(strat), records, nowMs = tBig + 5 * 60_000L)
+        assertTrue(elapsed.events.any { it.strategy.id == 30L && it.notificationType == StrategyNotificationType.STRATEGY_REACHED })
+    }
+
+    @Test
+    fun `Room v4 persists custom strategies, reordering, crash records, and StrategyConfig progression sync`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+
+            val s1 = CustomPatternStrategy(name = "Strat 1", colorSequenceCsv = "Pink", strategyGroup = StrategyGroup.COLOR_SEQUENCE, strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS)
+            val s2 = CustomPatternStrategy(name = "Strat 2", colorSequenceCsv = "Blue,Blue", strategyGroup = StrategyGroup.COLOR_SEQUENCE, strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS)
+            val id1 = repo.saveCustomStrategy(s1)
+            val id2 = repo.saveCustomStrategy(s2)
+
+            repo.swapStrategyOrder(id1, id2)
+            val ordered = repo.getCustomStrategies().sortedBy { it.sortOrder }
+            assertEquals("Strat 2", ordered[0].name)
+            assertEquals("Strat 1", ordered[1].name)
+
+            // afterLoss/addAmount are the single source of truth; mirrors are derived from them.
+            val cfg = StrategyConfig(
+                afterLoss = AfterLossMode.ADD,
+                addAmount = 15.0
+            ).normalized()
+            assertEquals(AfterLossMode.ADD, cfg.afterLoss)
+            assertEquals(15.0, cfg.addAmount, 0.001)
+
+            val fromLegacy = cfg.copy(afterLoss = AfterLossMode.KEEP).syncProgressionFromLegacy()
+            assertFalse(fromLegacy.lossProgressionEnabled)
+            assertEquals(StakeProgressionMode.DISABLED, fromLegacy.lossProgressionMode)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `AutomationEngine auto-bets immediately when CustomPatternStrategy matches single Pink crash`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val engineScope = CoroutineScope(SupervisorJob() + dispatcher)
+        try {
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 20.0,
+                    cashOutTarget = 2.0,
+                    bettingMode = BettingMode.USE_STRATEGY_RULES
+                )
+            )
+            // Disable default legacy StrategyRule so ONLY the CustomPatternStrategy drives betting
+            repo.getRules().forEach { repo.updateRule(it.copy(enabled = false)) }
+
+            repo.saveCustomStrategy(
+                CustomPatternStrategy(
+                    name = "Instant Pink Bet",
+                    isEnabled = true,
+                    strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+                    strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+                    colorMatchDirection = ColorMatchDirection.HORIZONTAL,
+                    colorSequenceCsv = CrashColorCategory.Pink.name
+                )
+            )
+
+            val platform = FakeTouchPlatform()
+            val driver = AutoTouchDriver(platform)
+            val scheduler = ScanScheduler(platform)
+            val engine = AutomationEngine(repo, scope = engineScope)
+            engine.attachAccessibility(driver, scheduler)
+            engine.start()
+            runCurrent()
+
+            // Round 1 sets baseline ribbon
+            engine.handleScreenEvent(
+                ScreenMap(
+                    timestampMs = 1_000L,
+                    packageName = "com.android.chrome",
+                    gameName = "Aviator",
+                    siteUrl = "BetPawa",
+                    phase = GamePhase.BETTING_OPEN,
+                    ribbonMultipliers = listOf(1.40, 1.80),
+                    stakeField = UiTarget("stake_input", RectBounds(140, 1120, 400, 1200), text = "20.00", isEditable = true),
+                    betButton = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
+                )
+            )
+            runCurrent()
+            assertTrue("Baseline round alone should not place bet", platform.clickedNodeIds.isEmpty())
+
+            // Round 2 observes a single Pink crash (12.50x) while betting opens -> should trigger & bet immediately!
+            engine.handleScreenEvent(
+                ScreenMap(
+                    timestampMs = 10_000L,
+                    packageName = "com.android.chrome",
+                    gameName = "Aviator",
+                    siteUrl = "BetPawa",
+                    phase = GamePhase.BETTING_OPEN,
+                    lastCrashMultiplier = 12.50,
+                    ribbonMultipliers = listOf(12.50, 1.40, 1.80),
+                    stakeField = UiTarget("stake_input", RectBounds(140, 1120, 400, 1200), text = "20.00", isEditable = true),
+                    betButton = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
+                )
+            )
+            runCurrent()
+
+            assertTrue("Expected bet_btn click when CustomPatternStrategy triggered", "bet_btn" in platform.clickedNodeIds)
+            assertTrue(engine.state.value.isPatternMatched || platform.hasCancelButton)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `AutomationEngine evaluates live ScreenMap ribbonChipColors against Visual Color Picker HEX filter`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .fallbackToDestructiveMigration()
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val engineScope = CoroutineScope(SupervisorJob() + dispatcher)
+        try {
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.getRules().forEach { repo.updateRule(it.copy(enabled = false)) }
+
+            val pickedHex = ColorClassifier.normalizeHex("#FF1493")
+            repo.saveCustomStrategy(
+                CustomPatternStrategy(
+                    name = "Exact HEX Pink Trigger",
+                    isEnabled = true,
+                    strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+                    strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+                    colorMatchDirection = ColorMatchDirection.HORIZONTAL,
+                    colorSequenceCsv = CrashColorCategory.Pink.name,
+                    customColorHexFilterCsv = pickedHex
+                )
+            )
+
+            val platform = FakeTouchPlatform()
+            val driver = AutoTouchDriver(platform)
+            val scheduler = ScanScheduler(platform)
+            val engine = AutomationEngine(repo, scope = engineScope)
+            engine.attachAccessibility(driver, scheduler)
+            engine.start()
+            runCurrent()
+
+            engine.handleScreenEvent(
+                ScreenMap(
+                    timestampMs = 1_000L,
+                    packageName = "com.android.chrome",
+                    gameName = "Aviator",
+                    phase = GamePhase.BETTING_OPEN,
+                    ribbonMultipliers = listOf(1.40, 1.80)
+                )
+            )
+            runCurrent()
+
+            engine.handleScreenEvent(
+                ScreenMap(
+                    timestampMs = 8_000L,
+                    packageName = "com.android.chrome",
+                    gameName = "Aviator",
+                    phase = GamePhase.BETTING_OPEN,
+                    lastCrashMultiplier = 11.40,
+                    ribbonMultipliers = listOf(11.40, 1.40, 1.80),
+                    ribbonChipColors = listOf(pickedHex)
+                )
+            )
+            runCurrent()
+
+            val stored = repo.getCrashRecords().lastOrNull()
+            assertEquals(pickedHex, stored?.detectedColorHex)
+            assertEquals(true, stored?.isPixelColorVerified)
+            assertTrue(engine.state.value.isPatternMatched)
+            assertEquals("Exact HEX Pink Trigger", engine.state.value.activeStrategyName)
+            engine.stopForExit()
+        } finally {
+            db.close()
+        }
+    }
+}

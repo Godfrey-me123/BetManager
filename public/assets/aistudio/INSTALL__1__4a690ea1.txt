@@ -1,0 +1,12 @@
+Install (remove .txt):
+AutomationEngine.kt        -> app/src/main/java/com/example/data/engine/
+StrategyConfig.kt          -> app/src/main/java/com/example/data/model/
+StrategyScreen.kt          -> app/src/main/java/com/example/ui/screens/
+BetManagerViewModel.kt     -> app/src/main/java/com/example/ui/
+BetManagerDao.kt           -> app/src/main/java/com/example/data/local/
+MartingaleProgressionTest.kt -> app/src/test/java/com/example/
+This AutomationEngine.kt REPLACES the one from my previous message (it contains those fixes too).
+After install: Settings -> "Stop after N losses" = 0 (never) or a higher number; press Save once.
+In Logcat / Logs tab look for lines "PROGRESSION LOSS mode=DOUBLE placed=20.00 next=40.00".
+Not compiled or run.
+CustomStrategyIntegrationTest.kt -> app/src/test/java/com/example/ (updated: builds the config from afterLoss/addAmount)

@@ -476,22 +476,26 @@ class BetManagerVerificationTest {
                     cashOutTarget = 2.0,
                     afterLoss = AfterLossMode.DOUBLE,
                     stopAfterLosses = 3,
-                    bettingMode = BettingMode.USE_STRATEGY_RULES
+                    bettingMode = BettingMode.BET_EVERY_ROUND
                 )
             )
-            val platform = FakeVerificationPlatform(clockMs = { testScheduler.currentTime })
+            val stakeTarget = UiTarget("stake", RectBounds(140, 1120, 380, 1200), text = "20.00", isEditable = true, isClickable = true)
+            val betTarget = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
+            platform.focusedTarget = stakeTarget
+            platform.confirmOnPoll = true
+            val platformRef = platform
             val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
-            engine.attachAccessibility(AutoTouchDriver(platform), ScanScheduler(platform, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
+            engine.attachAccessibility(AutoTouchDriver(platformRef), ScanScheduler(platformRef, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
             engine.start()
             runCurrent()
 
             // Baseline [1.68, 2.50]
-            engine.handleScreenEvent(ScreenMap(timestampMs = 1000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.68, 2.50)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 1000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertEquals(1.68, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
 
             // New crash 1.22x (<= 2.00 -> LOSS #1): Crash=1.22, pill[0]=1.22, Last=L, Stake=40.0
-            engine.handleScreenEvent(ScreenMap(timestampMs = 5000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.22, 1.68, 2.50)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 5000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertEquals(1.22, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
             assertEquals(1.22, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
@@ -499,7 +503,7 @@ class BetManagerVerificationTest {
             assertEquals(1, engine.state.value.consecutiveLosses)
 
             // New crash 1.11x (<= 2.00 -> LOSS #2): Crash=1.11, pill[0]=1.11, Last=L L, Stake=80.0
-            engine.handleScreenEvent(ScreenMap(timestampMs = 9000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.11, 1.22, 1.68, 2.50)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 9000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.11, 1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertEquals(1.11, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
             assertEquals(1.11, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
@@ -509,7 +513,7 @@ class BetManagerVerificationTest {
             assertEquals(listOf(false, false), lastFive.mapNotNull { it.won })
 
             // Crash exactly 2.00x (<= 2.00 -> LOSS #3): hits stopAfterLosses=3 and stops immediately
-            engine.handleScreenEvent(ScreenMap(timestampMs = 13_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 13_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertFalse("Engine must stop immediately when consecutive losses reach limit", engine.state.value.isRunning)
             assertEquals(20.0, engine.state.value.currentStake, 0.01)
@@ -519,13 +523,13 @@ class BetManagerVerificationTest {
             // Restart and test > 2.00x WIN resets doubled stake to 20.0 and 0 losses
             engine.start()
             runCurrent()
-            engine.handleScreenEvent(ScreenMap(timestampMs = 15_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68)))
-            engine.handleScreenEvent(ScreenMap(timestampMs = 19_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.30, 2.00, 1.11, 1.22)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 15_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 19_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.30, 2.00, 1.11, 1.22), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertEquals(40.0, engine.state.value.currentStake, 0.01)
             assertEquals(1, engine.state.value.consecutiveLosses)
 
-            engine.handleScreenEvent(ScreenMap(timestampMs = 23_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.01, 1.30, 2.00, 1.11)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 23_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.01, 1.30, 2.00, 1.11), stakeField = stakeTarget, betButton = betTarget))
             runCurrent()
             assertEquals(20.0, engine.state.value.currentStake, 0.01)
             assertEquals(0, engine.state.value.consecutiveLosses)

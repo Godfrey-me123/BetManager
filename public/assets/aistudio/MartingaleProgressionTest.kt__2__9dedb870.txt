@@ -1,0 +1,64 @@
+package com.example
+
+import com.example.data.engine.StakeCalculator
+import com.example.data.model.AfterLossMode
+import com.example.data.model.StrategyConfig
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class MartingaleProgressionTest {
+
+    @Test
+    fun double_chain_20_40_80_160_320() {
+        var stake = 20.0
+        var losses = 0
+        var deficit = 0.0
+        val expected = listOf(40.0, 80.0, 160.0, 320.0)
+        for (next in expected) {
+            val r = StakeCalculator.onLoss(
+                previousStake = stake, baseStake = 20.0, mode = AfterLossMode.DOUBLE,
+                addAmount = 10.0, previousConsecutiveLosses = losses, stopAfterLosses = 0, currentDeficit = deficit
+            )
+            assertEquals(next, r.nextStake, 0.001)
+            assertFalse(r.shouldStop)
+            stake = r.nextStake; losses = r.consecutiveLosses; deficit = r.recoveryDeficit
+        }
+        assertEquals(4, losses)
+        assertEquals(20.0 + 40.0 + 80.0 + 160.0, deficit, 0.001)
+    }
+
+    @Test
+    fun add_and_keep_modes() {
+        val add = StakeCalculator.onLoss(40.0, 20.0, AfterLossMode.ADD, 20.0, 1, 0, 20.0)
+        assertEquals(60.0, add.nextStake, 0.001)
+        val keep = StakeCalculator.onLoss(40.0, 20.0, AfterLossMode.KEEP, 20.0, 1, 0, 20.0)
+        assertEquals(40.0, keep.nextStake, 0.001)
+    }
+
+    @Test
+    fun full_recovery_win_resets_to_base() {
+        val r = StakeCalculator.onWin(
+            baseStake = 20.0, previousStake = 80.0, previousConsecutiveLosses = 2,
+            currentDeficit = 60.0, targetMultiplier = 2.0, resetAfterWin = true
+        )
+        assertEquals(20.0, r.nextStake, 0.001)
+        assertEquals(0, r.consecutiveLosses)
+    }
+
+    @Test
+    fun stop_after_losses_triggers_only_when_enabled() {
+        val off = StakeCalculator.onLoss(80.0, 20.0, AfterLossMode.DOUBLE, 10.0, 5, 0, 100.0)
+        assertFalse(off.shouldStop)
+        val on = StakeCalculator.onLoss(80.0, 20.0, AfterLossMode.DOUBLE, 10.0, 2, 3, 60.0)
+        assertTrue(on.shouldStop)
+    }
+
+    @Test
+    fun legacy_mirror_fields_can_never_change_afterLoss() {
+        val cfg = StrategyConfig(afterLoss = AfterLossMode.DOUBLE, lossProgressionEnabled = false)
+        assertEquals(AfterLossMode.DOUBLE, cfg.normalized().afterLoss)
+        assertEquals(AfterLossMode.DOUBLE, cfg.normalized().normalized().afterLoss)
+    }
+}

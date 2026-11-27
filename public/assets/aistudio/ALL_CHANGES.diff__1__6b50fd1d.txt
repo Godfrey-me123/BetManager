@@ -1,0 +1,353 @@
+=== data/engine/AutomationEngine.kt
+117a118,120
+>     private var pendingCreatedAtMs: Long = 0L
+>     /** Serialises every read-modify-write of stake / loss streak / deficit (single writer rule). */
+>     private val progressionLock = Mutex()
+340,357c343,366
+<             val curState = _state.value
+<             val shouldReset = resetProgression || (!curState.isRunning && curState.consecutiveLosses == 0 && curState.recoveryDeficit <= 0.01)
+<             val updatedStake = if (shouldReset) config.baseStake else curState.currentStake
+<             val updatedLosses = if (resetProgression) 0 else curState.consecutiveLosses
+<             val updatedDeficit = if (resetProgression) 0.0 else curState.recoveryDeficit
+<             if (resetProgression) {
+<                 repository.saveSessionProgression(updatedStake, 0, 0.0)
+<                 activeBet = activeBet?.copy(stake = updatedStake)
+<                 pendingSettlementBet = pendingSettlementBet?.copy(stake = updatedStake)
+<             }
+<             _state.update {
+<                 it.copy(
+<                     currentStake = updatedStake,
+<                     consecutiveLosses = updatedLosses,
+<                     recoveryDeficit = updatedDeficit,
+<                     afterLossMode = config.afterLoss,
+<                     targetMultiplier = safeTarget
+<                 )
+---
+>             // FIX(martingale): read the progression state INSIDE the lock. The old code took a snapshot first and
+>             // wrote it back later, which could undo a loss that was settled in between (stake went back down).
+>             progressionLock.withLock {
+>                 val curState = _state.value
+>                 val inRecovery = curState.consecutiveLosses > 0 || curState.recoveryDeficit > 0.01
+>                 val betLive = activeBet != null || pendingSettlementBet != null
+>                 // A reset request never wipes a recovery that is in progress while the bot runs or a bet is live.
+>                 val allowReset = resetProgression && !(curState.isRunning && inRecovery) && !betLive
+>                 val idleReset = !curState.isRunning && !inRecovery && !betLive
+>                 val updatedStake = if (allowReset || idleReset) config.baseStake else curState.currentStake
+>                 val updatedLosses = if (allowReset) 0 else curState.consecutiveLosses
+>                 val updatedDeficit = if (allowReset) 0.0 else curState.recoveryDeficit
+>                 if (allowReset) {
+>                     repository.saveSessionProgression(updatedStake, 0, 0.0)
+>                 }
+>                 _state.update {
+>                     it.copy(
+>                         currentStake = updatedStake,
+>                         consecutiveLosses = updatedLosses,
+>                         recoveryDeficit = updatedDeficit,
+>                         afterLossMode = config.afterLoss,
+>                         targetMultiplier = safeTarget
+>                     )
+>                 }
+502a512
+>         pendingCreatedAtMs = 0L
+559a570
+>                 pendingCreatedAtMs = nowMs
+779a791,792
+>         // FIX(martingale): a bet whose crash number was never read used to be dropped silently, so the loss
+>         // was never counted and the stake never doubled. Now it is settled from the screen evidence instead.
+781c794
+<         if (pending != null && nowMs - pending.placedAtMs > 25_000L) {
+---
+>         if (pending != null && pendingCreatedAtMs > 0L && nowMs - pendingCreatedAtMs > 12_000L) {
+782a796,797
+>             pendingCreatedAtMs = 0L
+>             settleWithoutCrashRead(pending, config, map)
+799a815
+>         val lastNewIdx = crashUpdate.newCrashMultipliers.lastIndex
+849c865,866
+<                 recordTimestampMs = ts
+---
+>                 recordTimestampMs = ts,
+>                 settleBet = idx == lastNewIdx
+1296c1313,1314
+<         latestMap: ScreenMap
+---
+>         latestMap: ScreenMap,
+>         crashKnown: Boolean = true
+1307c1325,1329
+<         if (obsCashMult != null) {
+---
+>         // FIX(martingale): a cash-out at X is impossible if the round crashed below X. Stale win banners or
+>         // balance bumps from the previous round used to be counted as a win and reset the stake to base.
+>         fun plausible(x: Double) = !crashKnown || crashMult + 0.02 >= x
+> 
+>         if (obsCashMult != null && plausible(obsCashMult)) {
+1316c1338
+<         if (obsWinAmt != null && obsWinAmt > bet.stake) {
+---
+>         if (obsWinAmt != null && obsWinAmt > bet.stake && plausible((obsWinAmt / bet.stake).coerceAtLeast(1.01))) {
+1338c1360,1362
+<         if (balAfterConfirm != null && balNow != null && (balNow - balAfterConfirm) >= bet.stake * 1.01) {
+---
+>         if (balAfterConfirm != null && balNow != null && (balNow - balAfterConfirm) >= bet.stake * 1.01 &&
+>             plausible(((balNow - balAfterConfirm) / bet.stake).coerceAtLeast(1.01))
+>         ) {
+1349c1373,1375
+<         if (balBefore != null && balNow != null && (balNow - balBefore) > 0.05) {
+---
+>         if (balBefore != null && balNow != null && (balNow - balBefore) > 0.05 &&
+>             plausible(((bet.stake + (balNow - balBefore)) / bet.stake).coerceAtLeast(1.01))
+>         ) {
+1370c1396
+<         if (crashMult <= 1.00) {
+---
+>         if (crashKnown && crashMult <= 1.00) {
+1391c1417,1418
+<         recordTimestampMs: Long = System.currentTimeMillis()
+---
+>         recordTimestampMs: Long = System.currentTimeMillis(),
+>         settleBet: Boolean = true
+1396c1423
+<         val won = crashMult > targetMult
+---
+>         val won = crashMult >= targetMult // game cashes out AT the target, so equal is a win
+1401c1428
+<         val bet = activeBet ?: pendingSettlementBet
+---
+>         val bet = if (settleBet) (activeBet ?: pendingSettlementBet) else null
+1412c1439
+<         val stakePlaced = bet?.stake ?: 0.0
+---
+>         val stakePlaced: Double? = bet?.stake // null for passive observation rounds (they are NOT bet results)
+1437c1464
+<                 won = actualWon,
+---
+>                 won = if (hasConfirmedBet) actualWon else null,
+1445,1467c1472,1477
+<             val progression = if (actualWon) {
+<                 StakeCalculator.onWin(
+<                     baseStake = config.baseStake,
+<                     previousStake = bet!!.stake,
+<                     previousConsecutiveLosses = prevLosses,
+<                     currentDeficit = prevDeficit,
+<                     targetMultiplier = targetMult,
+<                     resetAfterWin = config.resetAfterWin,
+<                     actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null
+<                 )
+<             } else {
+<                 StakeCalculator.onLoss(
+<                     previousStake = bet!!.stake,
+<                     baseStake = config.baseStake,
+<                     mode = config.afterLoss,
+<                     addAmount = config.addAmount,
+<                     previousConsecutiveLosses = prevLosses,
+<                     stopAfterLosses = config.stopAfterLosses,
+<                     currentDeficit = prevDeficit
+<                 )
+<             }
+< 
+<             repository.saveSessionProgression(progression.nextStake, progression.consecutiveLosses, progression.recoveryDeficit)
+---
+>             val progression = applyOutcome(
+>                 bet = bet!!,
+>                 won = actualWon,
+>                 actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null,
+>                 targetMult = targetMult
+>             )
+1478a1489
+>             pendingCreatedAtMs = 0L
+1504a1516,1624
+>         }
+>     }
+> 
+>     /**
+>      * SINGLE WRITER for stake progression. Every win/loss goes through here: it reads the latest settings from the
+>      * database (so the mode shown in Settings is the mode used), reads the current streak/deficit under the lock,
+>      * applies StakeCalculator, then saves + publishes the result in one step.
+>      */
+>     private suspend fun applyOutcome(
+>         bet: ActiveBetRecord,
+>         won: Boolean,
+>         actualProfit: Double?,
+>         targetMult: Double
+>     ): StakeProgressionResult = progressionLock.withLock {
+>         val cfg = repository.getConfig()
+>         val cur = _state.value
+>         val result = if (won) {
+>             StakeCalculator.onWin(
+>                 baseStake = cfg.baseStake,
+>                 previousStake = bet.stake,
+>                 previousConsecutiveLosses = cur.consecutiveLosses,
+>                 currentDeficit = cur.recoveryDeficit,
+>                 targetMultiplier = targetMult,
+>                 resetAfterWin = cfg.resetAfterWin,
+>                 actualProfit = actualProfit
+>             )
+>         } else {
+>             StakeCalculator.onLoss(
+>                 previousStake = bet.stake,
+>                 baseStake = cfg.baseStake,
+>                 mode = cfg.afterLoss,
+>                 addAmount = cfg.addAmount,
+>                 previousConsecutiveLosses = cur.consecutiveLosses,
+>                 stopAfterLosses = cfg.stopAfterLosses,
+>                 currentDeficit = cur.recoveryDeficit
+>             )
+>         }
+>         repository.saveSessionProgression(result.nextStake, result.consecutiveLosses, result.recoveryDeficit)
+>         _state.update {
+>             it.copy(
+>                 currentStake = result.nextStake,
+>                 consecutiveLosses = result.consecutiveLosses,
+>                 recoveryDeficit = result.recoveryDeficit,
+>                 afterLossMode = cfg.afterLoss
+>             )
+>         }
+>         repository.log(
+>             LogCategory.STAKE,
+>             "PROGRESSION ${if (won) "WIN" else "LOSS"} mode=${cfg.afterLoss.name}",
+>             "placed=${StakeCalculator.formatStake(bet.stake)} next=${StakeCalculator.formatStake(result.nextStake)} " +
+>                 "losses=${result.consecutiveLosses} deficit=${StakeCalculator.formatStake(result.recoveryDeficit)} " +
+>                 "add=${StakeCalculator.formatStake(cfg.addAmount)} stopAfter=${cfg.stopAfterLosses}"
+>         )
+>         result
+>     }
+> 
+>     /**
+>      * FIX(martingale): settles a confirmed bet whose crash number was never read (rare scanning, banner missed).
+>      * Uses the same verified-outcome rules. If the outcome is still unproven the stake is left untouched
+>      * (never guess a win), but a proven loss now doubles / adds exactly like a normal loss.
+>      */
+>     private suspend fun settleWithoutCrashRead(bet: ActiveBetRecord, config: StrategyConfig, latestMap: ScreenMap) {
+>         if (bet.roundSignature in settledBetSignatures) return
+>         val outcome = resolveVerifiedOutcome(bet, 0.0, latestMap, crashKnown = false)
+>         val won = outcome.won
+>         if (won == null) {
+>             repository.log(LogCategory.RESULT, "Bet outcome unproven, stake unchanged", outcome.reason)
+>             return
+>         }
+>         settledBetSignatures.add(bet.roundSignature)
+>         val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
+>         val profit = if (won) {
+>             if (outcome.profitDelta > 0.0) outcome.profitDelta else bet.stake * (targetMult - 1.0)
+>         } else {
+>             -bet.stake
+>         }
+>         roundCounter++
+>         val crashForRecord = _state.value.latestCrashMultiplier ?: 1.0
+>         repository.recordRound(
+>             RoundRecord(
+>                 roundId = "R-$roundCounter",
+>                 timestampMs = System.currentTimeMillis(),
+>                 crashMultiplier = crashForRecord,
+>                 stakePlaced = bet.stake,
+>                 targetMultiplier = targetMult,
+>                 won = won,
+>                 profitDelta = profit,
+>                 strategyName = (bet.strategyName ?: "Bet") + " (crash not read)",
+>                 siteName = latestMap.siteUrl
+>             )
+>         )
+>         val progression = applyOutcome(
+>             bet = bet,
+>             won = won,
+>             actualProfit = if (outcome.profitDelta > 0.0) outcome.profitDelta else null,
+>             targetMult = targetMult
+>         )
+>         val line = if (won) "Won (${outcome.reason})" else "Lost (${outcome.reason}) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
+>         repository.log(LogCategory.RESULT, line, "Crash number was not read; settled from screen evidence")
+>         _state.update {
+>             it.copy(
+>                 currentStake = progression.nextStake,
+>                 consecutiveLosses = progression.consecutiveLosses,
+>                 recoveryDeficit = progression.recoveryDeficit,
+>                 statusLine = line
+>             )
+>         }
+>         if (progression.shouldStop) {
+>             stop(progression.stopReason ?: "loss streak limit reached")
+=== data/model/StrategyConfig.kt
+203,215c203,211
+<     fun syncLegacyFromProgression(): StrategyConfig {
+<         val syncedAfterLoss = when {
+<             !lossProgressionEnabled || lossProgressionMode == StakeProgressionMode.DISABLED -> AfterLossMode.KEEP
+<             lossProgressionMode == StakeProgressionMode.ADD_AMOUNT -> AfterLossMode.ADD
+<             lossProgressionMode == StakeProgressionMode.DOUBLE_AMOUNT -> AfterLossMode.DOUBLE
+<             else -> afterLoss
+<         }
+<         return copy(
+<             afterLoss = syncedAfterLoss,
+<             addAmount = lossProgressionAddAmount.coerceAtLeast(0.0),
+<             targetMultiplier = cashOutTarget.coerceAtLeast(1.01)
+<         )
+<     }
+---
+>     /**
+>      * SINGLE SOURCE OF TRUTH: [afterLoss] + [addAmount] decide the stake progression. Nothing else may.
+>      * The lossProgression* / isMartingaleEnabled fields are only mirrors (kept for old screens and the DB schema)
+>      * and can never change [afterLoss] any more. This used to be two-way, so a stale mirror flipped Double -> Add/Keep.
+>      */
+>     fun normalized(): StrategyConfig = syncProgressionFromLegacy()
+> 
+>     @Deprecated("Mirrors can no longer drive the mode; use normalized()", ReplaceWith("normalized()"))
+>     fun syncLegacyFromProgression(): StrategyConfig = syncProgressionFromLegacy()
+=== ui/screens/StrategyScreen.kt
+128,129c128,130
+<     var lossProgressionEnabled by remember(config.lossProgressionEnabled) {
+<         mutableStateOf(config.lossProgressionEnabled)
+---
+>     // SINGLE SOURCE OF TRUTH: these controls read and write config.afterLoss / config.addAmount (same as Settings).
+>     var lossProgressionEnabled by remember(config.afterLoss) {
+>         mutableStateOf(config.afterLoss != com.example.data.model.AfterLossMode.KEEP)
+131,132c132,139
+<     var lossProgressionMode by remember(config.lossProgressionMode) {
+<         mutableStateOf(config.lossProgressionMode)
+---
+>     var lossProgressionMode by remember(config.afterLoss) {
+>         mutableStateOf(
+>             when (config.afterLoss) {
+>                 com.example.data.model.AfterLossMode.DOUBLE -> StakeProgressionMode.DOUBLE_AMOUNT
+>                 com.example.data.model.AfterLossMode.ADD -> StakeProgressionMode.ADD_AMOUNT
+>                 com.example.data.model.AfterLossMode.KEEP -> StakeProgressionMode.DISABLED
+>             }
+>         )
+134,135c141,142
+<     var lossProgressionAddAmountText by remember(config.lossProgressionAddAmount) {
+<         mutableStateOf(String.format(Locale.US, "%.2f", config.lossProgressionAddAmount))
+---
+>     var lossProgressionAddAmountText by remember(config.addAmount) {
+>         mutableStateOf(String.format(Locale.US, "%.2f", config.addAmount))
+497c504
+<                         val parsedAddAmt = lossProgressionAddAmountText.trim().toDoubleOrNull() ?: config.lossProgressionAddAmount
+---
+>                         val parsedAddAmt = lossProgressionAddAmountText.trim().toDoubleOrNull() ?: config.addAmount
+527,530c534,540
+<                             lossProgressionEnabled = lossProgressionEnabled && effectiveMode != StakeProgressionMode.DISABLED,
+<                             lossProgressionMode = effectiveMode,
+<                             lossProgressionAddAmount = parsedAddAmt
+<                         ).syncLegacyFromProgression()
+---
+>                             afterLoss = when (effectiveMode) {
+>                                 StakeProgressionMode.DOUBLE_AMOUNT -> com.example.data.model.AfterLossMode.DOUBLE
+>                                 StakeProgressionMode.ADD_AMOUNT -> com.example.data.model.AfterLossMode.ADD
+>                                 StakeProgressionMode.DISABLED -> com.example.data.model.AfterLossMode.KEEP
+>                             },
+>                             addAmount = parsedAddAmt
+>                         ).normalized()
+=== ui/BetManagerViewModel.kt
+219c219
+<         val synced = updated.syncLegacyFromProgression()
+---
+>         val synced = updated.normalized()
+=== data/local/BetManagerDao.kt
+61c61
+<     @Query("SELECT * FROM round_records WHERE stakePlaced IS NOT NULL ORDER BY timestampMs DESC, id DESC LIMIT 5")
+---
+>     @Query("SELECT * FROM round_records WHERE stakePlaced IS NOT NULL AND stakePlaced > 0 ORDER BY timestampMs DESC, id DESC LIMIT 5")
+67c67
+<     @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
+---
+>     @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND stakePlaced > 0 AND won IS NOT NULL")
+70c70
+<     @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
+---
+>     @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND stakePlaced > 0 AND won IS NOT NULL")

@@ -1398,31 +1398,31 @@ class AutomationEngine(
         val prevLosses = _state.value.consecutiveLosses
         val prevDeficit = _state.value.recoveryDeficit
 
-        val progression = if (won) {
-            StakeCalculator.onWin(
-                baseStake = config.baseStake,
-                previousStake = currentStake,
-                previousConsecutiveLosses = prevLosses,
-                currentDeficit = 0.0,
-                targetMultiplier = targetMult,
-                resetAfterWin = config.resetAfterWin
-            )
-        } else {
-            StakeCalculator.onLoss(
-                previousStake = currentStake,
-                baseStake = config.baseStake,
-                mode = config.afterLoss,
-                addAmount = config.addAmount,
-                previousConsecutiveLosses = prevLosses,
-                stopAfterLosses = config.stopAfterLosses,
-                currentDeficit = prevDeficit
-            )
+        val bet = activeBet ?: pendingSettlementBet
+        val hasConfirmedBet = bet != null
+        val roundSig = bet?.roundSignature ?: "OBS-$roundCounter"
+
+        if (hasConfirmedBet) {
+            if (roundSig in settledBetSignatures) {
+                return
+            }
+            settledBetSignatures.add(roundSig)
         }
 
-        val bet = activeBet ?: pendingSettlementBet
-        val stakePlaced = bet?.stake ?: currentStake
-        val profitDelta = if (bet != null) {
-            if (won) bet.stake * (targetMult - 1.0) else -bet.stake
+        val stakePlaced = bet?.stake ?: 0.0
+        val outcome = if (hasConfirmedBet) {
+            resolveVerifiedOutcome(bet!!, crashMult, latestMap)
+        } else {
+            null
+        }
+        val actualWon = outcome?.won ?: won
+        val profitDelta = if (hasConfirmedBet) {
+            if (actualWon) {
+                val baseProfit = bet!!.stake * (targetMult - 1.0)
+                if (outcome?.profitDelta != null && outcome.profitDelta > 0.0) outcome.profitDelta else baseProfit
+            } else {
+                -bet!!.stake
+            }
         } else {
             0.0
         }
@@ -1434,42 +1434,74 @@ class AutomationEngine(
                 crashMultiplier = crashMult,
                 stakePlaced = stakePlaced,
                 targetMultiplier = targetMult,
-                won = won,
+                won = actualWon,
                 profitDelta = profitDelta,
                 strategyName = bet?.strategyName ?: "Live Observation",
                 siteName = siteUrl
             )
         )
 
-        repository.saveSessionProgression(progression.nextStake, progression.consecutiveLosses, progression.recoveryDeficit)
+        if (hasConfirmedBet) {
+            val progression = if (actualWon) {
+                StakeCalculator.onWin(
+                    baseStake = config.baseStake,
+                    previousStake = bet!!.stake,
+                    previousConsecutiveLosses = prevLosses,
+                    currentDeficit = prevDeficit,
+                    targetMultiplier = targetMult,
+                    resetAfterWin = config.resetAfterWin,
+                    actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null
+                )
+            } else {
+                StakeCalculator.onLoss(
+                    previousStake = bet!!.stake,
+                    baseStake = config.baseStake,
+                    mode = config.afterLoss,
+                    addAmount = config.addAmount,
+                    previousConsecutiveLosses = prevLosses,
+                    stopAfterLosses = config.stopAfterLosses,
+                    currentDeficit = prevDeficit
+                )
+            }
 
-        val resultLine = if (won) {
-            "Won (${StakeCalculator.formatStake(crashMult)}x > ${StakeCalculator.formatStake(targetMult)}x) -> Reset stake"
+            repository.saveSessionProgression(progression.nextStake, progression.consecutiveLosses, progression.recoveryDeficit)
+
+            val resultLine = if (actualWon) {
+                "Won (${StakeCalculator.formatStake(crashMult)}x > ${StakeCalculator.formatStake(targetMult)}x) -> Reset stake"
+            } else {
+                "Lost (${StakeCalculator.formatStake(crashMult)}x <= ${StakeCalculator.formatStake(targetMult)}x) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
+            }
+
+            repository.log(LogCategory.RESULT, resultLine, "Crash ${StakeCalculator.formatStake(crashMult)}x")
+
+            releaseBetLock()
+            pendingSettlementBet = null
+
+            _state.update {
+                it.copy(
+                    currentStake = progression.nextStake,
+                    consecutiveLosses = progression.consecutiveLosses,
+                    recoveryDeficit = progression.recoveryDeficit,
+                    latestCrashMultiplier = crashMult,
+                    monitoredCrashCount = crashTracker.monitoredCrashCount,
+                    recordedMultipliers = liveRecordedMultipliers.toList(),
+                    statusLine = resultLine,
+                    handState = FloatingHandState.WAITING,
+                    handStatusText = "Waiting"
+                )
+            }
+
+            if (progression.shouldStop) {
+                stop(progression.stopReason ?: "loss streak limit reached")
+            }
         } else {
-            "Lost (${StakeCalculator.formatStake(crashMult)}x <= ${StakeCalculator.formatStake(targetMult)}x) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
-        }
-
-        repository.log(LogCategory.RESULT, resultLine, "Crash ${StakeCalculator.formatStake(crashMult)}x")
-
-        releaseBetLock()
-        pendingSettlementBet = null
-
-        _state.update {
-            it.copy(
-                currentStake = progression.nextStake,
-                consecutiveLosses = progression.consecutiveLosses,
-                recoveryDeficit = progression.recoveryDeficit,
-                latestCrashMultiplier = crashMult,
-                monitoredCrashCount = crashTracker.monitoredCrashCount,
-                recordedMultipliers = liveRecordedMultipliers.toList(),
-                statusLine = resultLine,
-                handState = FloatingHandState.WAITING,
-                handStatusText = "Waiting"
-            )
-        }
-
-        if (progression.shouldStop) {
-            stop(progression.stopReason ?: "loss streak limit reached")
+            _state.update {
+                it.copy(
+                    latestCrashMultiplier = crashMult,
+                    monitoredCrashCount = crashTracker.monitoredCrashCount,
+                    recordedMultipliers = liveRecordedMultipliers.toList()
+                )
+            }
         }
     }
 
