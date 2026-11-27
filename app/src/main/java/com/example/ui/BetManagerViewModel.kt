@@ -216,19 +216,14 @@ class BetManagerViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun saveStrategyConfig(updated: StrategyConfig) {
-        val synced = updated.syncLegacyFromProgression()
-        val curState = engineState.value
-        val resetProg = !curState.isRunning && curState.consecutiveLosses == 0 && curState.recoveryDeficit <= 0.01
-        if (resetProg) {
-            repository.saveSessionProgression(synced.baseStake, 0, 0.0)
-        }
+        val synced = updated.normalized()
         viewModelScope.launch {
             repository.saveConfig(synced)
-            engine.syncStakeWithConfig(resetProgression = resetProg)
+            engine.syncStakeWithConfig(resetProgression = false)
             repository.log(
                 LogCategory.STRATEGY,
                 "Saved strategy configuration",
-                "Low < ${synced.lowThreshold}x · Big >= ${synced.bigThreshold}x · Mode=${synced.lossProgressionMode.name}"
+                "Low < ${synced.lowThreshold}x · Big >= ${synced.bigThreshold}x · Mode=${synced.afterLoss.name}"
             )
         }
     }
@@ -317,24 +312,19 @@ class BetManagerViewModel(application: Application) : AndroidViewModel(applicati
 
     fun updateBaseStake(value: Double) {
         val safe = value.coerceAtLeast(0.01)
-        val curState = engineState.value
-        val resetProg = !curState.isRunning && curState.consecutiveLosses == 0 && curState.recoveryDeficit <= 0.01
-        if (resetProg) {
-            repository.saveSessionProgression(safe, 0, 0.0)
-        }
-        updateConfig(resetEngineProgression = resetProg) { it.copy(baseStake = safe) }
+        updateConfig { it.copy(baseStake = safe).normalized() }
     }
 
     fun updateAfterLossMode(mode: AfterLossMode) {
-        updateConfig { it.copy(afterLoss = mode).syncProgressionFromLegacy() }
+        updateConfig { it.copy(afterLoss = mode).normalized() }
     }
 
     fun updateAddAmount(value: Double) {
-        updateConfig { it.copy(addAmount = value.coerceAtLeast(0.0)).syncProgressionFromLegacy() }
+        updateConfig { it.copy(addAmount = value.coerceAtLeast(0.0)).normalized() }
     }
 
     fun updateStopAfterLosses(count: Int) {
-        updateConfig { it.copy(stopAfterLosses = count.coerceAtLeast(0)) }
+        updateConfig { it.copy(stopAfterLosses = count.coerceAtLeast(0)).normalized() }
     }
 
     fun updateCashOutTarget(target: Double) {
@@ -375,9 +365,7 @@ class BetManagerViewModel(application: Application) : AndroidViewModel(applicati
 
     fun resetStakeToBase() {
         viewModelScope.launch {
-            val base = repository.getConfig().baseStake
-            repository.saveSessionProgression(base, 0, 0.0)
-            engine.syncStakeWithConfig(resetProgression = true)
+            val base = engine.resetProgressionToBase()
             repository.log(LogCategory.STAKE, "Stake manually reset to ${StakeCalculator.formatStake(base)}")
         }
     }

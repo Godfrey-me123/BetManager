@@ -1,0 +1,158 @@
+=== AutomationEngine (vs previous delivery)
+217a218,221
+>             // A NEW PROCESS IS A NEW LAUNCH: drop every leftover of the previous play session first.
+>             runCatching { repository.clearSessionData() }
+>             calibratedBetBounds = null
+>             calibratedHandBounds = null
+525a530,576
+>         }
+>     }
+> 
+>     /** Restarts the background time-schedule tick (stopped on exit) when the app is launched again. */
+>     fun resumeAfterLaunch() {
+>         startPeriodicTimerTick()
+>     }
+> 
+>     /**
+>      * Full stop + wipe of the play session (called on EXIT and when the app is closed):
+>      * cancels monitoring, heartbeat, timers, alarms and notifications, forgets every in-memory round/bet/lock,
+>      * clears the stored session data and resets the UI state to a clean "new launch" state.
+>      * User settings and strategies are kept.
+>      */
+>     suspend fun resetForNewSession() {
+>         stopForExit()
+>         scanMutex.withLock {
+>             progressionLock.withLock {
+>                 activeBet = null
+>                 pendingSettlementBet = null
+>                 pendingCreatedAtMs = 0L
+>                 lockedRoundKey = null
+>                 lockedAtMs = 0L
+>                 sawCancelOrFlightAfterBet = false
+>                 isBetActionPending = false
+>                 previousPhase = GamePhase.UNKNOWN
+>                 roundCounter = 0L
+>                 liveRecordedMultipliers.clear()
+>                 consumedPatternSignatures.clear()
+>                 settledBetSignatures.clear()
+>                 crashTracker.resetSession()
+>                 calibratedBetBounds = null
+>                 calibratedHandBounds = null
+>                 runCatching { patternAlertManager?.clearNotifications() }
+>                 runCatching { AlarmAudioController.stopAlarm() }
+>                 repository.clearSessionData()
+>                 val cfg = repository.getConfig()
+>                 val connected = _state.value.serviceConnected
+>                 _state.value = EngineUiState(
+>                     serviceConnected = connected,
+>                     statusLine = "Stopped: press Start to watch the game",
+>                     currentStake = cfg.baseStake,
+>                     afterLossMode = cfg.afterLoss,
+>                     targetMultiplier = cfg.cashOutTarget.coerceAtLeast(1.01),
+>                     betTargetSummary = "Drag BET hand onto game Bet button"
+>                 )
+>             }
+=== service/ScreenEarnerAccessibilityService
+49c49,61
+<         fun performFullExit(context: Context) {
+---
+>         /** True after EXIT / app close: overlays stay hidden and nothing runs until the app is launched again. */
+>         @Volatile
+>         var exited: Boolean = false
+>             private set
+> 
+>         /** Called by MainActivity every time the app is launched: leaves the exited state and restores the overlay. */
+>         fun onAppLaunched() {
+>             exited = false
+>             runCatching { sharedEngine?.resumeAfterLaunch() }
+>             instance?.restoreOverlayAfterLaunch()
+>         }
+> 
+>         fun performFullExit(context: Context, relaunchExit: Boolean = true) {
+50a63,64
+>             if (exited && !relaunchExit) return // already exited (activity finishing after EXIT)
+>             exited = true
+51a66
+>             runCatching { AlarmAudioController.stopAlarm() }
+52a68,71
+>             // Wipe the play session (rounds, crashes, stake progression, logs...). Settings/strategies are kept.
+>             CoroutineScope(Dispatchers.IO).launch {
+>                 runCatching { sharedEngine?.resetForNewSession() }
+>             }
+58c77
+<             runCatching {
+---
+>             if (relaunchExit) runCatching {
+238c257
+<                     if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
+---
+>                     if (d.config.showFloatingHand && !exited) overlayManager?.show() else overlayManager?.hide()
+387c406,413
+<         overlayManager?.show()
+---
+>         if (!exited) overlayManager?.show()
+>     }
+> 
+>     fun restoreOverlayAfterLaunch() {
+>         if (!::repository.isInitialized) return
+>         serviceScope.launch {
+>             if (repository.getConfig().showFloatingHand) overlayManager?.show()
+>         }
+=== MainActivity
+69a70,78
+>     override fun onDestroy() {
+>         // Closing the app (back out, swipe from recents, EXIT) quits every action and overlay and wipes the session.
+>         // Rotation / system-driven recreation is NOT a close, and going to the Home screen keeps automation running.
+>         if (isFinishing && !isChangingConfigurations) {
+>             com.example.service.ScreenEarnerAccessibilityService.performFullExit(applicationContext, relaunchExit = false)
+>         }
+>         super.onDestroy()
+>     }
+> 
+78a88,90
+> 
+>         // Launching the app = new session: leave the "exited" state and bring the overlay back.
+>         com.example.service.ScreenEarnerAccessibilityService.onAppLaunched()
+=== data/local/BetManagerRepository
+204a205,227
+>     /**
+>      * Wipes everything that belongs to a PLAY SESSION so the next launch starts fresh from the live game:
+>      * rounds, crash/multiplier history, pattern occurrences, notification history, logs, stake progression
+>      * (stake / loss streak / deficit), consumed trigger signatures and the calibrated game-screen bounds.
+>      * KEEPS user setup: settings, strategies, alarm profiles, notification settings, overlay position and toggles.
+>      */
+>     suspend fun clearSessionData() {
+>         dao.clearRounds()
+>         dao.clearCrashRecords()
+>         dao.clearMultiplierRecords()
+>         dao.clearPatternOccurrences()
+>         dao.clearNotificationHistory()
+>         dao.clearLogs()
+>         prefs.edit()
+>             .remove(KEY_CURRENT_STAKE)
+>             .remove(KEY_CONSECUTIVE_LOSSES)
+>             .remove(KEY_RECOVERY_DEFICIT)
+>             .remove(KEY_CONSUMED_TRIGGERS)
+>             .remove(KEY_TARGET_BOUNDS)
+>             .remove(KEY_HAND_DROP_BOUNDS)
+>             .commit()
+>     }
+> 
+=== BetManagerDao (vs previous delivery)
+87a88,103
+>     // ---- session wipe (app closed / exited / fresh launch) ----
+>     @Query("DELETE FROM round_records")
+>     suspend fun clearRounds()
+> 
+>     @Query("DELETE FROM crash_records")
+>     suspend fun clearCrashRecords()
+> 
+>     @Query("DELETE FROM multiplier_records")
+>     suspend fun clearMultiplierRecords()
+> 
+>     @Query("DELETE FROM pattern_occurrences")
+>     suspend fun clearPatternOccurrences()
+> 
+>     @Query("DELETE FROM notification_history")
+>     suspend fun clearNotificationHistory()
+> 

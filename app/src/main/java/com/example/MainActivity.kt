@@ -72,10 +72,19 @@ class MainActivity : ComponentActivity() {
         handleExitIntent(intent)
     }
 
+    override fun onDestroy() {
+        if (isFinishing && !isChangingConfigurations) {
+            com.example.service.ScreenEarnerAccessibilityService.performFullExit(applicationContext, relaunchExit = false)
+        }
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (handleExitIntent(intent)) return
         captureDeepLinkExtras(intent)
+
+        com.example.service.ScreenEarnerAccessibilityService.onAppLaunched()
 
         enableEdgeToEdge()
 

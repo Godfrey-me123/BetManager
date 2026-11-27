@@ -122,17 +122,24 @@ fun StrategyScreen(
     var maxAttemptsText by remember(config.maxStrategyBetAttempts) {
         mutableStateOf(config.maxStrategyBetAttempts.toString())
     }
-    var martingaleEnabled by remember(config.isMartingaleEnabled) {
-        mutableStateOf(config.isMartingaleEnabled)
+    // SINGLE SOURCE OF TRUTH: these controls read and write config.afterLoss / config.addAmount (same as Settings).
+    var martingaleEnabled by remember(config.afterLoss) {
+        mutableStateOf(config.afterLoss != com.example.data.model.AfterLossMode.KEEP)
     }
-    var lossProgressionEnabled by remember(config.lossProgressionEnabled) {
-        mutableStateOf(config.lossProgressionEnabled)
+    var lossProgressionEnabled by remember(config.afterLoss) {
+        mutableStateOf(config.afterLoss != com.example.data.model.AfterLossMode.KEEP)
     }
-    var lossProgressionMode by remember(config.lossProgressionMode) {
-        mutableStateOf(config.lossProgressionMode)
+    var lossProgressionMode by remember(config.afterLoss) {
+        mutableStateOf(
+            when (config.afterLoss) {
+                com.example.data.model.AfterLossMode.DOUBLE -> StakeProgressionMode.DOUBLE_AMOUNT
+                com.example.data.model.AfterLossMode.ADD -> StakeProgressionMode.ADD_AMOUNT
+                com.example.data.model.AfterLossMode.KEEP -> StakeProgressionMode.DISABLED
+            }
+        )
     }
-    var lossProgressionAddAmountText by remember(config.lossProgressionAddAmount) {
-        mutableStateOf(String.format(Locale.US, "%.2f", config.lossProgressionAddAmount))
+    var lossProgressionAddAmountText by remember(config.addAmount) {
+        mutableStateOf(String.format(Locale.US, "%.2f", config.addAmount))
     }
 
     var selectedGroupFilter by remember { mutableStateOf<StrategyGroup?>(null) }
@@ -424,7 +431,15 @@ fun StrategyScreen(
                         label = "Martingale Progression (follows Master Loss Progression rule)",
                         checked = martingaleEnabled,
                         testTag = "martingale_switch"
-                    ) { martingaleEnabled = it }
+                    ) { enabled ->
+                        martingaleEnabled = enabled
+                        lossProgressionEnabled = enabled
+                        if (enabled && lossProgressionMode == StakeProgressionMode.DISABLED) {
+                            lossProgressionMode = StakeProgressionMode.DOUBLE_AMOUNT
+                        } else if (!enabled) {
+                            lossProgressionMode = StakeProgressionMode.DISABLED
+                        }
+                    }
 
                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
@@ -443,10 +458,13 @@ fun StrategyScreen(
                         label = "Enable Post-Loss Stake Progression",
                         checked = lossProgressionEnabled,
                         testTag = "strategy_loss_progression_switch"
-                    ) {
-                        lossProgressionEnabled = it
-                        if (it && lossProgressionMode == StakeProgressionMode.DISABLED) {
+                    ) { enabled ->
+                        lossProgressionEnabled = enabled
+                        martingaleEnabled = enabled
+                        if (enabled && lossProgressionMode == StakeProgressionMode.DISABLED) {
                             lossProgressionMode = StakeProgressionMode.DOUBLE_AMOUNT
+                        } else if (!enabled) {
+                            lossProgressionMode = StakeProgressionMode.DISABLED
                         }
                     }
                     FlowRow(
@@ -463,6 +481,7 @@ fun StrategyScreen(
                                 onClick = {
                                     lossProgressionMode = mode
                                     lossProgressionEnabled = mode != StakeProgressionMode.DISABLED
+                                    martingaleEnabled = lossProgressionEnabled
                                 },
                                 label = { Text(title, fontSize = 11.sp, fontWeight = FontWeight.Bold) },
                                 modifier = Modifier.testTag("strategy_progression_mode_${mode.name}")
@@ -494,7 +513,7 @@ fun StrategyScreen(
                         val parsedBig = bigThreshText.trim().toDoubleOrNull()
                         val parsedConsec = defaultConsecutiveText.trim().toIntOrNull()
                         val parsedMaxAttempts = maxAttemptsText.trim().toIntOrNull()?.coerceAtLeast(1) ?: 2
-                        val parsedAddAmt = lossProgressionAddAmountText.trim().toDoubleOrNull() ?: config.lossProgressionAddAmount
+                        val parsedAddAmt = lossProgressionAddAmountText.trim().toDoubleOrNull() ?: config.addAmount
 
                         if (parsedLow == null || !parsedLow.isFinite() || parsedLow < 1.01 ||
                             parsedBig == null || !parsedBig.isFinite() || parsedBig <= parsedLow ||
@@ -523,11 +542,13 @@ fun StrategyScreen(
                             strategy2HighThreshold = parsedBig,
                             monitoringEnabled = monitoringEnabled,
                             maxStrategyBetAttempts = parsedMaxAttempts,
-                            isMartingaleEnabled = martingaleEnabled,
-                            lossProgressionEnabled = lossProgressionEnabled && effectiveMode != StakeProgressionMode.DISABLED,
-                            lossProgressionMode = effectiveMode,
-                            lossProgressionAddAmount = parsedAddAmt
-                        ).syncLegacyFromProgression()
+                            afterLoss = when (effectiveMode) {
+                                StakeProgressionMode.DOUBLE_AMOUNT -> com.example.data.model.AfterLossMode.DOUBLE
+                                StakeProgressionMode.ADD_AMOUNT -> com.example.data.model.AfterLossMode.ADD
+                                StakeProgressionMode.DISABLED -> com.example.data.model.AfterLossMode.KEEP
+                            },
+                            addAmount = parsedAddAmt
+                        ).normalized()
                         onSaveConfig(updatedConfig)
                         isSaving = false
                         Toast.makeText(context, "Strategy settings saved", Toast.LENGTH_SHORT).show()

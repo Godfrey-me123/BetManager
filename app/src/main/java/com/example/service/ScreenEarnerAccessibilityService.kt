@@ -42,20 +42,38 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
             }
         }
 
+        /** True after EXIT / app close: overlays stay hidden and nothing runs until the app is launched again. */
+        @Volatile
+        var exited: Boolean = false
+            private set
+
+        /** Called by MainActivity every time the app is launched: leaves the exited state and restores the overlay. */
+        fun onAppLaunched() {
+            exited = false
+            runCatching { sharedEngine?.resumeAfterLaunch() }
+            instance?.restoreOverlayAfterLaunch()
+        }
+
         /**
          * Stops monitoring & automation, hides all floating hands/panels, cancels notifications,
-         * and launches ACTION_EXIT_APP to finish and clear every Activity in the task stack.
+         * wipes play-session progression/history, and launches ACTION_EXIT_APP when requested.
          */
-        fun performFullExit(context: Context) {
+        fun performFullExit(context: Context, relaunchExit: Boolean = true) {
+            if (exited && !relaunchExit) return
+            exited = true
             val appCtx = context.applicationContext
+            runCatching { AlarmAudioController.stopAlarm() }
             runCatching { sharedEngine?.stopForExit() }
+            CoroutineScope(Dispatchers.IO).launch {
+                runCatching { sharedEngine?.resetForNewSession() }
+            }
             runCatching { instance?.hideFloatingHand() }
             runCatching { ScreenEarnerOverlayService.clearStatusNotification(appCtx) }
             runCatching {
                 val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
                 nm?.cancelAll()
             }
-            runCatching {
+            if (relaunchExit) runCatching {
                 val exitIntent = Intent(appCtx, MainActivity::class.java).apply {
                     action = MainActivity.ACTION_EXIT_APP
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or
@@ -161,7 +179,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
             onSelectAfterLossMode = { mode ->
                 serviceScope.launch {
                     val c = repository.getConfig()
-                    repository.saveConfig(c.copy(afterLoss = mode).syncProgressionFromLegacy())
+                    repository.saveConfig(c.copy(afterLoss = mode).normalized())
                     engine.syncStakeWithConfig()
                 }
             },
@@ -235,7 +253,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
             combine(coreFlow, prefsFlow) { core, prefs -> core to prefs }
                 .collectLatest { (d, p) ->
                     val ui = d.ui
-                    if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
+                    if (d.config.showFloatingHand && !exited) overlayManager?.show() else overlayManager?.hide()
                     val stake = ui.currentStake
                     overlayManager?.update(
                         OverlayInfo(
@@ -302,14 +320,9 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
                 c.baseStake >= 20 -> 10.0
                 else -> 1.0
             }
-            val cur = engine.state.value
             val newBase = maxOf(1.0, c.baseStake + dir * step)
-            repository.saveConfig(c.copy(baseStake = newBase))
-            val resetProg = cur.consecutiveLosses == 0 && cur.recoveryDeficit <= 0.01
-            if (resetProg) {
-                repository.saveSessionProgression(newBase, 0, 0.0)
-            }
-            engine.syncStakeWithConfig(resetProgression = resetProg)
+            repository.saveConfig(c.copy(baseStake = newBase).normalized())
+            engine.syncStakeWithConfig(resetProgression = false)
         }
     }
 
@@ -384,7 +397,14 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
     }
 
     fun showFloatingHand() {
-        overlayManager?.show()
+        if (!exited) overlayManager?.show()
+    }
+
+    fun restoreOverlayAfterLaunch() {
+        if (!::repository.isInitialized) return
+        serviceScope.launch {
+            if (repository.getConfig().showFloatingHand && !exited) overlayManager?.show()
+        }
     }
 
     fun showAndExpandOverlay() {

@@ -115,6 +115,8 @@ class AutomationEngine(
 
     private var activeBet: ActiveBetRecord? = null
     private var pendingSettlementBet: ActiveBetRecord? = null
+    private var pendingCreatedAtMs: Long = 0L
+    private val progressionLock = Mutex()
     private var isBetActionPending: Boolean = false
     private var engineStartedAtMs: Long = 0L
     private var alarmObserverJob: kotlinx.coroutines.Job? = null
@@ -212,28 +214,42 @@ class AutomationEngine(
     init {
         initJob = scope.launch {
             repository.ensureInitialized()
-            val config = repository.getConfig()
-            val savedStake = repository.getSavedCurrentStake(config.baseStake)
-            val savedLosses = repository.getConsecutiveLosses()
-            val savedDeficit = repository.getSavedRecoveryDeficit()
-            val handAutoBet = repository.isHandAutoBetEnabled()
-            val hasTarget = (calibratedBetBounds ?: calibratedHandBounds) != null
-            consumedPatternSignatures.addAll(repository.getConsumedTriggerSignatures())
-            _state.update {
-                it.copy(
-                    currentStake = savedStake,
-                    consecutiveLosses = savedLosses,
-                    recoveryDeficit = savedDeficit,
-                    handAutoBetEnabled = handAutoBet,
-                    afterLossMode = config.afterLoss,
-                    targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01),
-                    betTargetDetected = hasTarget,
-                    betTargetSummary = if (hasTarget) {
-                        "Bet target calibrated"
-                    } else {
-                        "Drag BET hand onto game Bet button"
-                    }
-                )
+            progressionLock.withLock {
+                val config = repository.getConfig()
+                val rawLosses = repository.getConsecutiveLosses()
+                val rawDeficit = repository.getSavedRecoveryDeficit()
+                val rawStake = repository.getSavedCurrentStake(config.baseStake)
+                val validRecovery = (rawLosses > 0 || rawDeficit > 0.01) &&
+                    config.afterLoss != AfterLossMode.KEEP
+                val savedStake = if (validRecovery) {
+                    rawStake.coerceAtLeast(config.baseStake)
+                } else {
+                    config.baseStake
+                }
+                val savedLosses = if (validRecovery) rawLosses else 0
+                val savedDeficit = if (validRecovery) rawDeficit else 0.0
+                if (!validRecovery && (rawLosses != 0 || rawDeficit > 0.01 || kotlin.math.abs(rawStake - config.baseStake) > 0.01)) {
+                    repository.saveSessionProgression(config.baseStake, 0, 0.0)
+                }
+                val handAutoBet = repository.isHandAutoBetEnabled()
+                val hasTarget = (calibratedBetBounds ?: calibratedHandBounds) != null
+                consumedPatternSignatures.addAll(repository.getConsumedTriggerSignatures())
+                _state.update {
+                    it.copy(
+                        currentStake = savedStake,
+                        consecutiveLosses = savedLosses,
+                        recoveryDeficit = savedDeficit,
+                        handAutoBetEnabled = handAutoBet,
+                        afterLossMode = config.afterLoss,
+                        targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01),
+                        betTargetDetected = hasTarget,
+                        betTargetSummary = if (hasTarget) {
+                            "Bet target calibrated"
+                        } else {
+                            "Drag BET hand onto game Bet button"
+                        }
+                    )
+                }
             }
         }
         startAlarmStateObserver()
@@ -335,26 +351,52 @@ class AutomationEngine(
     fun syncStakeWithConfig(resetProgression: Boolean = false) {
         scope.launch {
             initJob?.join()
-            val config = repository.getConfig()
-            val safeTarget = config.cashOutTarget.coerceAtLeast(1.01)
-            val curState = _state.value
-            val shouldReset = resetProgression || (!curState.isRunning && curState.consecutiveLosses == 0 && curState.recoveryDeficit <= 0.01)
-            val updatedStake = if (shouldReset) config.baseStake else curState.currentStake
-            val updatedLosses = if (resetProgression) 0 else curState.consecutiveLosses
-            val updatedDeficit = if (resetProgression) 0.0 else curState.recoveryDeficit
-            if (resetProgression) {
-                repository.saveSessionProgression(updatedStake, 0, 0.0)
-                activeBet = activeBet?.copy(stake = updatedStake)
-                pendingSettlementBet = pendingSettlementBet?.copy(stake = updatedStake)
+            progressionLock.withLock {
+                val config = repository.getConfig()
+                val safeTarget = config.cashOutTarget.coerceAtLeast(1.01)
+                val curState = _state.value
+                val inRecovery = curState.consecutiveLosses > 0 || curState.recoveryDeficit > 0.01
+                val betLive = activeBet != null || pendingSettlementBet != null
+                val allowReset = resetProgression
+                val idleReset = !curState.isRunning && !inRecovery && !betLive
+                val updatedStake = if (allowReset || idleReset) config.baseStake else curState.currentStake
+                val updatedLosses = if (allowReset) 0 else curState.consecutiveLosses
+                val updatedDeficit = if (allowReset) 0.0 else curState.recoveryDeficit
+                if (allowReset || (idleReset && kotlin.math.abs(updatedStake - curState.currentStake) > 0.001)) {
+                    repository.saveSessionProgression(updatedStake, updatedLosses, updatedDeficit)
+                }
+                _state.update {
+                    it.copy(
+                        currentStake = updatedStake,
+                        consecutiveLosses = updatedLosses,
+                        recoveryDeficit = updatedDeficit,
+                        afterLossMode = config.afterLoss,
+                        targetMultiplier = safeTarget
+                    )
+                }
             }
-            _state.update {
-                it.copy(
-                    currentStake = updatedStake,
-                    consecutiveLosses = updatedLosses,
-                    recoveryDeficit = updatedDeficit,
-                    afterLossMode = config.afterLoss,
-                    targetMultiplier = safeTarget
-                )
+        }
+    }
+
+    suspend fun resetProgressionToBase(): Double {
+        initJob?.join()
+        return progressionLock.withLock {
+            val config = repository.getConfig()
+            val base = config.baseStake
+            if (activeBet == null && pendingSettlementBet == null) {
+                repository.saveSessionProgression(base, 0, 0.0)
+                _state.update {
+                    it.copy(
+                        currentStake = base,
+                        consecutiveLosses = 0,
+                        recoveryDeficit = 0.0,
+                        afterLossMode = config.afterLoss,
+                        targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01)
+                    )
+                }
+                base
+            } else {
+                _state.value.currentStake
             }
         }
     }
@@ -408,14 +450,25 @@ class AutomationEngine(
         startJob?.cancel()
         startJob = scope.launch {
             initJob?.join()
-            val config = repository.getConfig()
-            val savedLosses = repository.getConsecutiveLosses()
-            val savedDeficit = repository.getSavedRecoveryDeficit()
-            val savedStake = if (savedLosses == 0 && savedDeficit <= 0.01 && config.resetAfterWin) {
-                config.baseStake
-            } else {
-                repository.getSavedCurrentStake(config.baseStake)
+            var startConfig = StrategyConfig()
+            var savedStake = startConfig.baseStake
+            var savedLosses = 0
+            var savedDeficit = 0.0
+            progressionLock.withLock {
+                startConfig = repository.getConfig()
+                val rawLosses = repository.getConsecutiveLosses()
+                val rawDeficit = repository.getSavedRecoveryDeficit()
+                val validRecovery = (rawLosses > 0 || rawDeficit > 0.01) &&
+                    startConfig.afterLoss != AfterLossMode.KEEP
+                savedLosses = if (validRecovery) rawLosses else 0
+                savedDeficit = if (validRecovery) rawDeficit else 0.0
+                savedStake = if (validRecovery) {
+                    repository.getSavedCurrentStake(startConfig.baseStake).coerceAtLeast(startConfig.baseStake)
+                } else {
+                    startConfig.baseStake
+                }
             }
+            val config = startConfig
             crashTracker.resetSession()
             if (activeBet == null) {
                 lockedRoundKey = null
@@ -500,6 +553,7 @@ class AutomationEngine(
         timerTickJob = null
         releaseBetLock()
         pendingSettlementBet = null
+        pendingCreatedAtMs = 0L
         crashTracker.resetSession()
         patternAlertManager?.clearNotifications()
         liveRecordedMultipliers.clear()
@@ -513,6 +567,52 @@ class AutomationEngine(
                 isAlarmActive = false,
                 activeAlarmTitle = null
             )
+        }
+    }
+
+    /** Restarts the background time-schedule tick (stopped on exit) when the app is launched again. */
+    fun resumeAfterLaunch() {
+        startPeriodicTimerTick()
+    }
+
+    /**
+     * Full stop + wipe of the play session (called on EXIT and when the app is closed):
+     * cancels monitoring, heartbeat, timers, alarms and notifications, clears session history and progression,
+     * and resets UI state to a clean launch state while keeping user settings and strategies.
+     */
+    suspend fun resetForNewSession() {
+        stopForExit()
+        scanMutex.withLock {
+            progressionLock.withLock {
+                activeBet = null
+                pendingSettlementBet = null
+                pendingCreatedAtMs = 0L
+                lockedRoundKey = null
+                lockedAtMs = 0L
+                sawCancelOrFlightAfterBet = false
+                isBetActionPending = false
+                previousPhase = GamePhase.UNKNOWN
+                roundCounter = 0L
+                liveRecordedMultipliers.clear()
+                consumedPatternSignatures.clear()
+                settledBetSignatures.clear()
+                crashTracker.resetSession()
+                calibratedBetBounds = null
+                calibratedHandBounds = null
+                runCatching { patternAlertManager?.clearNotifications() }
+                runCatching { AlarmAudioController.stopAlarm() }
+                repository.clearSessionData()
+                val cfg = repository.getConfig()
+                val connected = _state.value.serviceConnected
+                _state.value = EngineUiState(
+                    serviceConnected = connected,
+                    statusLine = "Stopped: press Start to watch the game",
+                    currentStake = cfg.baseStake,
+                    afterLossMode = cfg.afterLoss,
+                    targetMultiplier = cfg.cashOutTarget.coerceAtLeast(1.01),
+                    betTargetSummary = "Drag BET hand onto game Bet button"
+                )
+            }
         }
     }
 
@@ -555,8 +655,9 @@ class AutomationEngine(
 
         if (transitionedToNewBetting || openBetButtonProvesIdle || canvasFallbackCleared) {
             val currentActive = activeBet
-            if (currentActive != null && (sawCancelOrFlightAfterBet || elapsedMs >= 1_500L)) {
+            if (currentActive != null && (sawCancelOrFlightAfterBet || transitionedToNewBetting || elapsedMs >= 1_500L)) {
                 pendingSettlementBet = currentActive
+                pendingCreatedAtMs = nowMs
             }
             releaseBetLock()
             return true
@@ -778,8 +879,10 @@ class AutomationEngine(
         pendingSettlementBet = enrichBetWithScreenEvidence(pendingSettlementBet, map)
 
         val pending = pendingSettlementBet
-        if (pending != null && nowMs - pending.placedAtMs > 25_000L) {
+        if (pending != null && pendingCreatedAtMs > 0L && nowMs - pendingCreatedAtMs > 12_000L) {
             pendingSettlementBet = null
+            pendingCreatedAtMs = 0L
+            settleWithoutCrashRead(pending, config, map)
         }
 
         // Track crashed multipliers whenever running OR whenever an active/pending bet awaits settlement
@@ -797,6 +900,7 @@ class AutomationEngine(
 
         // Only append newly confirmed live crashes (no bulk-importing pre-existing ribbon history)
         val wasRunningBeforeCrash = _state.value.isRunning
+        val lastNewIdx = crashUpdate.newCrashMultipliers.lastIndex
         crashUpdate.newCrashMultipliers.forEachIndexed { idx, crashMult ->
             liveRecordedMultipliers.add(0, crashMult)
             while (liveRecordedMultipliers.size > 50) {
@@ -846,7 +950,8 @@ class AutomationEngine(
                 siteUrl = map.siteUrl,
                 config = config,
                 latestMap = map,
-                recordTimestampMs = ts
+                recordTimestampMs = ts,
+                settleBet = idx == lastNewIdx
             )
         }
 
@@ -1160,7 +1265,7 @@ class AutomationEngine(
                 return
             }
 
-            val stake = _state.value.currentStake
+            val stake = progressionLock.withLock { _state.value.currentStake }
             val todayProfit = repository.getTodayProfit()
             val balanceBefore = map.balance
 
@@ -1293,7 +1398,8 @@ class AutomationEngine(
     private fun resolveVerifiedOutcome(
         bet: ActiveBetRecord,
         crashMult: Double,
-        latestMap: ScreenMap
+        latestMap: ScreenMap,
+        crashKnown: Boolean = true
     ): VerifiedSettlementOutcome {
         val enriched = enrichBetWithScreenEvidence(bet, latestMap)!!
         val obsCashMult = enriched.observedCashOutMultiplier
@@ -1304,7 +1410,9 @@ class AutomationEngine(
         val balAfterConfirm = enriched.balanceAfterConfirm
         val balNow = enriched.latestObservedBalance
 
-        if (obsCashMult != null) {
+        fun plausible(x: Double) = !crashKnown || crashMult + 0.02 >= x
+
+        if (obsCashMult != null && plausible(obsCashMult)) {
             val profit = obsWinAmt?.let { it - bet.stake } ?: (bet.stake * (obsCashMult - 1.0))
             return VerifiedSettlementOutcome(
                 won = true,
@@ -1313,7 +1421,7 @@ class AutomationEngine(
                 reason = "Verified cashout ${StakeCalculator.formatStake(obsCashMult)}x"
             )
         }
-        if (obsWinAmt != null && obsWinAmt > bet.stake) {
+        if (obsWinAmt != null && obsWinAmt > bet.stake && plausible((obsWinAmt / bet.stake).coerceAtLeast(1.01))) {
             val profit = obsWinAmt - bet.stake
             val effTarget = (obsWinAmt / bet.stake).coerceAtLeast(1.01)
             return VerifiedSettlementOutcome(
@@ -1335,7 +1443,9 @@ class AutomationEngine(
                 reason = "Verified via built-in Auto Cash Out ${StakeCalculator.formatStake(autoTarget)}x"
             )
         }
-        if (balAfterConfirm != null && balNow != null && (balNow - balAfterConfirm) >= bet.stake * 1.01) {
+        if (balAfterConfirm != null && balNow != null && (balNow - balAfterConfirm) >= bet.stake * 1.01 &&
+            plausible(((balNow - balAfterConfirm) / bet.stake).coerceAtLeast(1.01))
+        ) {
             val payout = balNow - balAfterConfirm
             val profit = payout - bet.stake
             val effTarget = (payout / bet.stake).coerceAtLeast(1.01)
@@ -1346,7 +1456,9 @@ class AutomationEngine(
                 reason = "Verified balance payout +${StakeCalculator.formatStake(profit)}"
             )
         }
-        if (balBefore != null && balNow != null && (balNow - balBefore) > 0.05) {
+        if (balBefore != null && balNow != null && (balNow - balBefore) > 0.05 &&
+            plausible(((bet.stake + (balNow - balBefore)) / bet.stake).coerceAtLeast(1.01))
+        ) {
             val profit = balNow - balBefore
             val effTarget = ((bet.stake + profit) / bet.stake).coerceAtLeast(1.01)
             return VerifiedSettlementOutcome(
@@ -1367,7 +1479,7 @@ class AutomationEngine(
                 reason = "Verified stake loss via balance"
             )
         }
-        if (crashMult <= 1.00) {
+        if (crashKnown && crashMult <= 1.00) {
             return VerifiedSettlementOutcome(
                 won = false,
                 profitDelta = -bet.stake,
@@ -1388,40 +1500,41 @@ class AutomationEngine(
         siteUrl: String,
         config: StrategyConfig,
         latestMap: ScreenMap,
-        recordTimestampMs: Long = System.currentTimeMillis()
+        recordTimestampMs: Long = System.currentTimeMillis(),
+        settleBet: Boolean = true
     ) {
         roundCounter++
         val roundId = "R-$roundCounter"
         val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
         val won = crashMult > targetMult
-        val currentStake = _state.value.currentStake
-        val prevLosses = _state.value.consecutiveLosses
-        val prevDeficit = _state.value.recoveryDeficit
 
-        val bet = activeBet ?: pendingSettlementBet
+        val bet = if (settleBet) (activeBet ?: pendingSettlementBet) else null
         val hasConfirmedBet = bet != null
         val roundSig = bet?.roundSignature ?: "OBS-$roundCounter"
 
         if (hasConfirmedBet) {
             if (roundSig in settledBetSignatures) {
+                releaseBetLock()
+                pendingSettlementBet = null
+                pendingCreatedAtMs = 0L
                 return
             }
             settledBetSignatures.add(roundSig)
         }
 
-        val stakePlaced = bet?.stake ?: 0.0
-        val outcome = if (hasConfirmedBet) {
-            resolveVerifiedOutcome(bet!!, crashMult, latestMap)
+        val stakePlaced: Double? = bet?.stake
+        val outcome = if (bet != null) {
+            resolveVerifiedOutcome(bet, crashMult, latestMap)
         } else {
             null
         }
         val actualWon = outcome?.won ?: won
-        val profitDelta = if (hasConfirmedBet) {
+        val profitDelta = if (bet != null) {
             if (actualWon) {
-                val baseProfit = bet!!.stake * (targetMult - 1.0)
+                val baseProfit = bet.stake * (targetMult - 1.0)
                 if (outcome?.profitDelta != null && outcome.profitDelta > 0.0) outcome.profitDelta else baseProfit
             } else {
-                -bet!!.stake
+                -bet.stake
             }
         } else {
             0.0
@@ -1434,37 +1547,20 @@ class AutomationEngine(
                 crashMultiplier = crashMult,
                 stakePlaced = stakePlaced,
                 targetMultiplier = targetMult,
-                won = actualWon,
+                won = if (bet != null) actualWon else null,
                 profitDelta = profitDelta,
                 strategyName = bet?.strategyName ?: "Live Observation",
                 siteName = siteUrl
             )
         )
 
-        if (hasConfirmedBet) {
-            val progression = if (actualWon) {
-                StakeCalculator.onWin(
-                    baseStake = config.baseStake,
-                    previousStake = bet!!.stake,
-                    previousConsecutiveLosses = prevLosses,
-                    currentDeficit = prevDeficit,
-                    targetMultiplier = targetMult,
-                    resetAfterWin = config.resetAfterWin,
-                    actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null
-                )
-            } else {
-                StakeCalculator.onLoss(
-                    previousStake = bet!!.stake,
-                    baseStake = config.baseStake,
-                    mode = config.afterLoss,
-                    addAmount = config.addAmount,
-                    previousConsecutiveLosses = prevLosses,
-                    stopAfterLosses = config.stopAfterLosses,
-                    currentDeficit = prevDeficit
-                )
-            }
-
-            repository.saveSessionProgression(progression.nextStake, progression.consecutiveLosses, progression.recoveryDeficit)
+        if (bet != null) {
+            val progression = applyOutcome(
+                bet = bet,
+                won = actualWon,
+                actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null,
+                targetMult = targetMult
+            )
 
             val resultLine = if (actualWon) {
                 "Won (${StakeCalculator.formatStake(crashMult)}x > ${StakeCalculator.formatStake(targetMult)}x) -> Reset stake"
@@ -1476,6 +1572,7 @@ class AutomationEngine(
 
             releaseBetLock()
             pendingSettlementBet = null
+            pendingCreatedAtMs = 0L
 
             _state.update {
                 it.copy(
@@ -1502,6 +1599,109 @@ class AutomationEngine(
                     recordedMultipliers = liveRecordedMultipliers.toList()
                 )
             }
+        }
+    }
+
+    /**
+     * SINGLE WRITER for stake progression. Reads config and progression state under [progressionLock],
+     * applies [StakeCalculator], persists, and publishes to [_state] atomically.
+     */
+    private suspend fun applyOutcome(
+        bet: ActiveBetRecord,
+        won: Boolean,
+        actualProfit: Double?,
+        targetMult: Double
+    ): StakeProgressionResult = progressionLock.withLock {
+        val cfg = repository.getConfig()
+        val cur = _state.value
+        val result = if (won) {
+            StakeCalculator.onWin(
+                baseStake = cfg.baseStake,
+                previousStake = bet.stake,
+                previousConsecutiveLosses = cur.consecutiveLosses,
+                currentDeficit = cur.recoveryDeficit,
+                targetMultiplier = targetMult,
+                resetAfterWin = cfg.resetAfterWin,
+                actualProfit = actualProfit
+            )
+        } else {
+            StakeCalculator.onLoss(
+                previousStake = bet.stake,
+                baseStake = cfg.baseStake,
+                mode = cfg.afterLoss,
+                addAmount = cfg.addAmount,
+                previousConsecutiveLosses = cur.consecutiveLosses,
+                stopAfterLosses = cfg.stopAfterLosses,
+                currentDeficit = cur.recoveryDeficit
+            )
+        }
+        repository.saveSessionProgression(result.nextStake, result.consecutiveLosses, result.recoveryDeficit)
+        _state.update {
+            it.copy(
+                currentStake = result.nextStake,
+                consecutiveLosses = result.consecutiveLosses,
+                recoveryDeficit = result.recoveryDeficit,
+                afterLossMode = cfg.afterLoss
+            )
+        }
+        repository.log(
+            LogCategory.STAKE,
+            "PROGRESSION ${if (won) "WIN" else "LOSS"} mode=${cfg.afterLoss.name}",
+            "placed=${StakeCalculator.formatStake(bet.stake)} next=${StakeCalculator.formatStake(result.nextStake)} " +
+                "losses=${result.consecutiveLosses} deficit=${StakeCalculator.formatStake(result.recoveryDeficit)} " +
+                "add=${StakeCalculator.formatStake(cfg.addAmount)} stopAfter=${cfg.stopAfterLosses}"
+        )
+        result
+    }
+
+    private suspend fun settleWithoutCrashRead(bet: ActiveBetRecord, config: StrategyConfig, latestMap: ScreenMap) {
+        if (bet.roundSignature in settledBetSignatures) return
+        val outcome = resolveVerifiedOutcome(bet, 0.0, latestMap, crashKnown = false)
+        val won = outcome.won
+        if (won == null) {
+            repository.log(LogCategory.RESULT, "Bet outcome unproven, stake unchanged", outcome.reason)
+            return
+        }
+        settledBetSignatures.add(bet.roundSignature)
+        val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
+        val profit = if (won) {
+            if (outcome.profitDelta > 0.0) outcome.profitDelta else bet.stake * (targetMult - 1.0)
+        } else {
+            -bet.stake
+        }
+        roundCounter++
+        val crashForRecord = _state.value.latestCrashMultiplier ?: 1.0
+        repository.recordRound(
+            RoundRecord(
+                roundId = "R-$roundCounter",
+                timestampMs = System.currentTimeMillis(),
+                crashMultiplier = crashForRecord,
+                stakePlaced = bet.stake,
+                targetMultiplier = targetMult,
+                won = won,
+                profitDelta = profit,
+                strategyName = (bet.strategyName ?: "Bet") + " (crash not read)",
+                siteName = latestMap.siteUrl
+            )
+        )
+        val progression = applyOutcome(
+            bet = bet,
+            won = won,
+            actualProfit = if (outcome.profitDelta > 0.0) outcome.profitDelta else null,
+            targetMult = targetMult
+        )
+        val line = if (won) "Won (${outcome.reason})" else "Lost (${outcome.reason}) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
+        repository.log(LogCategory.RESULT, line, "Crash number was not read; settled from screen evidence")
+        _state.update {
+            it.copy(
+                currentStake = progression.nextStake,
+                consecutiveLosses = progression.consecutiveLosses,
+                recoveryDeficit = progression.recoveryDeficit,
+                statusLine = line
+            )
+        }
+        if (progression.shouldStop) {
+            stop(progression.stopReason ?: "loss streak limit reached")
         }
     }
 

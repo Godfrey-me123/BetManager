@@ -200,19 +200,14 @@ data class StrategyConfig(
     val cashOutUntrackedBets: Boolean = true,
     val queueBetDuringFlight: Boolean = false
 ) {
-    fun syncLegacyFromProgression(): StrategyConfig {
-        val syncedAfterLoss = when {
-            !lossProgressionEnabled || lossProgressionMode == StakeProgressionMode.DISABLED -> AfterLossMode.KEEP
-            lossProgressionMode == StakeProgressionMode.ADD_AMOUNT -> AfterLossMode.ADD
-            lossProgressionMode == StakeProgressionMode.DOUBLE_AMOUNT -> AfterLossMode.DOUBLE
-            else -> afterLoss
-        }
-        return copy(
-            afterLoss = syncedAfterLoss,
-            addAmount = lossProgressionAddAmount.coerceAtLeast(0.0),
-            targetMultiplier = cashOutTarget.coerceAtLeast(1.01)
-        )
-    }
+    /**
+     * SINGLE SOURCE OF TRUTH: [afterLoss] + [addAmount] decide the stake progression.
+     * The lossProgression* / isMartingaleEnabled fields are derived mirrors only.
+     */
+    fun normalized(): StrategyConfig = syncProgressionFromLegacy()
+
+    @Deprecated("Mirrors can no longer drive the mode; use normalized()", ReplaceWith("normalized()"))
+    fun syncLegacyFromProgression(): StrategyConfig = syncProgressionFromLegacy()
 
     fun syncProgressionFromLegacy(): StrategyConfig {
         val syncedMode = when (afterLoss) {
@@ -229,12 +224,10 @@ data class StrategyConfig(
         )
     }
 
-    fun resolvedMasterProgressionMode(): StakeProgressionMode {
-        return if (lossProgressionEnabled && lossProgressionMode != StakeProgressionMode.DISABLED) {
-            lossProgressionMode
-        } else {
-            StakeProgressionMode.DISABLED
-        }
+    fun resolvedMasterProgressionMode(): StakeProgressionMode = when (afterLoss) {
+        AfterLossMode.DOUBLE -> StakeProgressionMode.DOUBLE_AMOUNT
+        AfterLossMode.ADD -> StakeProgressionMode.ADD_AMOUNT
+        AfterLossMode.KEEP -> StakeProgressionMode.DISABLED
     }
 
     fun getRuleConfigs(): List<StrategyRuleConfig> = deserializeRuleConfigs(ruleConfigsJson)

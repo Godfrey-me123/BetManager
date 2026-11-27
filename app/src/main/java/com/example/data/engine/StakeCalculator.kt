@@ -61,7 +61,7 @@ object StakeCalculator {
         val safeBase = roundCurrency(baseStake.coerceAtLeast(0.01))
         val safePrev = roundCurrency(previousStake.coerceAtLeast(safeBase))
         val newLossStreak = previousConsecutiveLosses + 1
-        val newDeficit = currentDeficit + safePrev
+        val newDeficit = roundCurrency(currentDeficit + safePrev)
 
         if (stopAfterLosses > 0 && newLossStreak >= stopAfterLosses) {
             return StakeProgressionResult(
@@ -69,14 +69,14 @@ object StakeCalculator {
                 consecutiveLosses = 0,
                 shouldStop = true,
                 stopReason = "Stopped: $newLossStreak losses in a row",
-                recoveryDeficit = newDeficit
+                recoveryDeficit = 0.0
             )
         }
 
         val computed = when (mode) {
             AfterLossMode.DOUBLE -> safePrev * 2.0
             AfterLossMode.ADD -> safePrev + addAmount.coerceAtLeast(0.0)
-            AfterLossMode.KEEP -> safePrev
+            AfterLossMode.KEEP -> safeBase
         }
 
         return StakeProgressionResult(

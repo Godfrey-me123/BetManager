@@ -120,10 +120,8 @@ class CrashMonitorTracker {
                         }
                         if (newlyRecorded.isNotEmpty()) {
                             summary = "Recorded ${newlyRecorded.size} crash(es), latest ${formatMult(newlyRecorded.last())}x"
-                            if (map.phase == GamePhase.CRASHED && bannerCrash != null && approxEq(bannerCrash, newlyRecorded.last())) {
-                                pendingCrashFromBanner = bannerCrash
-                                lastBannerCrashRecordedAtMs = nowMs
-                            }
+                            pendingCrashFromBanner = bannerCrash?.takeIf { approxEq(it, newlyRecorded.last()) } ?: newlyRecorded.last()
+                            lastBannerCrashRecordedAtMs = nowMs
                         }
                         latestCrashMultiplier = currentRibbon.first()
                     }

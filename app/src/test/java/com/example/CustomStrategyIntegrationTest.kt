@@ -330,14 +330,19 @@ class CustomStrategyIntegrationTest {
             assertEquals("Strat 1", ordered[1].name)
 
             val cfg = StrategyConfig(
-                lossProgressionEnabled = true,
-                lossProgressionMode = StakeProgressionMode.ADD_AMOUNT,
-                lossProgressionAddAmount = 15.0
-            ).syncLegacyFromProgression()
+                afterLoss = AfterLossMode.ADD,
+                addAmount = 15.0,
+                lossProgressionEnabled = false,
+                lossProgressionMode = StakeProgressionMode.DISABLED,
+                lossProgressionAddAmount = 999.0
+            ).normalized()
             assertEquals(AfterLossMode.ADD, cfg.afterLoss)
             assertEquals(15.0, cfg.addAmount, 0.001)
+            assertTrue(cfg.lossProgressionEnabled)
+            assertEquals(StakeProgressionMode.ADD_AMOUNT, cfg.lossProgressionMode)
+            assertEquals(15.0, cfg.lossProgressionAddAmount, 0.001)
 
-            val fromLegacy = cfg.copy(afterLoss = AfterLossMode.KEEP).syncProgressionFromLegacy()
+            val fromLegacy = cfg.copy(afterLoss = AfterLossMode.KEEP).normalized()
             assertFalse(fromLegacy.lossProgressionEnabled)
             assertEquals(StakeProgressionMode.DISABLED, fromLegacy.lossProgressionMode)
         } finally {
@@ -350,6 +355,7 @@ class CustomStrategyIntegrationTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
             .build()
         val dispatcher = StandardTestDispatcher(testScheduler)
         val engineScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -429,7 +435,7 @@ class CustomStrategyIntegrationTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
-            .fallbackToDestructiveMigration()
+            .fallbackToDestructiveMigration(true)
             .build()
         val dispatcher = StandardTestDispatcher(testScheduler)
         val engineScope = CoroutineScope(SupervisorJob() + dispatcher)

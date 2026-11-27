@@ -71,7 +71,7 @@ class BetManagerRepository(
     suspend fun getConfig(): StrategyConfig = dao.getConfig() ?: StrategyConfig()
 
     suspend fun saveConfig(config: StrategyConfig) {
-        dao.upsertConfig(config)
+        dao.upsertConfig(config.normalized())
     }
 
     suspend fun getRules(): List<StrategyRule> = dao.getRules()
@@ -201,6 +201,28 @@ class BetManagerRepository(
     }
 
     suspend fun clearLogs() = dao.clearLogs()
+
+    /**
+     * Wipes play-session state (rounds, crash/multiplier history, pattern occurrences,
+     * notification history, logs, stake progression, consumed triggers, calibrated bounds)
+     * while preserving user settings, strategies, alarm/notification preferences, and overlay positions.
+     */
+    suspend fun clearSessionData() {
+        dao.clearRounds()
+        dao.clearCrashRecords()
+        dao.clearMultiplierRecords()
+        dao.clearPatternOccurrences()
+        dao.clearNotificationHistory()
+        dao.clearLogs()
+        prefs.edit()
+            .remove(KEY_CURRENT_STAKE)
+            .remove(KEY_CONSECUTIVE_LOSSES)
+            .remove(KEY_RECOVERY_DEFICIT)
+            .remove(KEY_CONSUMED_TRIGGERS)
+            .remove(KEY_TARGET_BOUNDS)
+            .remove(KEY_HAND_DROP_BOUNDS)
+            .commit()
+    }
 
     fun getSavedCurrentStake(defaultBase: Double): Double {
         val raw = prefs.getFloat(KEY_CURRENT_STAKE, -1f)

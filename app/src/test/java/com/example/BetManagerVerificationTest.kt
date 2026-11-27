@@ -76,6 +76,8 @@ class BetManagerVerificationTest {
         var focusedTarget: UiTarget? = null
         var setTextResult: Boolean = true
         var setTextUpdatesStakeTo: String? = null
+        var currentStakeText: String? = null
+        val setTextHistory = mutableListOf<String>()
         var confirmOnPoll: Boolean = true
         val gestureTaps = mutableListOf<Pair<Float, Float>>()
 
@@ -89,9 +91,13 @@ class BetManagerVerificationTest {
                 packageName = "com.android.chrome",
                 phase = GamePhase.BETTING_OPEN
             )
+            val syncedStakeField = base.stakeField?.let { field ->
+                currentStakeText?.let { field.copy(text = it) } ?: field
+            }
             return base.copy(
+                stakeField = syncedStakeField,
                 hasImeWindow = imeOpen,
-                cancelButton = if (confirmOnPoll && gestureTaps.isNotEmpty() && base.cancelButton == null) {
+                cancelButton = if (confirmOnPoll && base.cancelButton == null) {
                     UiTarget("cancel", RectBounds(520, 1100, 980, 1240), text = "Cancel", isEnabled = true, isClickable = true)
                 } else {
                     base.cancelButton
@@ -100,17 +106,25 @@ class BetManagerVerificationTest {
         }
 
         override fun findNode(query: String, editableOnly: Boolean): UiTarget? =
-            screenMapProvider?.invoke()?.stakeField
+            screenMapProvider?.invoke()?.stakeField?.let { field ->
+                currentStakeText?.let { field.copy(text = it) } ?: field
+            }
 
         override fun findFocusedInput(): UiTarget? = focusedTarget
 
         override fun hasImeWindow(): Boolean = imeOpen
 
-        override fun performNodeClick(nodeId: String): Boolean = true
+        override fun performNodeClick(nodeId: String): Boolean {
+            gestureTaps += 500f to 500f
+            return true
+        }
 
         override fun performSetText(nodeId: String, text: String): Boolean {
             if (!setTextResult) return false
-            focusedTarget = focusedTarget?.copy(text = setTextUpdatesStakeTo ?: text)
+            val written = setTextUpdatesStakeTo ?: text
+            currentStakeText = written
+            setTextHistory += written
+            focusedTarget = focusedTarget?.copy(text = written)
             return true
         }
 
@@ -465,9 +479,11 @@ class BetManagerVerificationTest {
         val context = ApplicationProvider.getApplicationContext<Application>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
             .build()
         val dispatcher = StandardTestDispatcher(testScheduler)
         try {
+            context.getSharedPreferences("betmanager_state", android.content.Context.MODE_PRIVATE).edit().clear().commit()
             val repo = BetManagerRepository(context, db.betManagerDao())
             repo.ensureInitialized()
             repo.saveConfig(
@@ -479,10 +495,20 @@ class BetManagerVerificationTest {
                     bettingMode = BettingMode.BET_EVERY_ROUND
                 )
             )
+            val platform = FakeVerificationPlatform(clockMs = { testScheduler.currentTime })
             val stakeTarget = UiTarget("stake", RectBounds(140, 1120, 380, 1200), text = "20.00", isEditable = true, isClickable = true)
             val betTarget = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
             platform.focusedTarget = stakeTarget
             platform.confirmOnPoll = true
+            platform.screenMapProvider = {
+                ScreenMap(
+                    timestampMs = testScheduler.currentTime,
+                    packageName = "com.android.chrome",
+                    phase = GamePhase.BETTING_OPEN,
+                    stakeField = stakeTarget,
+                    betButton = betTarget
+                )
+            }
             val platformRef = platform
             val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
             engine.attachAccessibility(AutoTouchDriver(platformRef), ScanScheduler(platformRef, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
@@ -490,21 +516,24 @@ class BetManagerVerificationTest {
             runCurrent()
 
             // Baseline [1.68, 2.50]
-            engine.handleScreenEvent(ScreenMap(timestampMs = 1000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(1000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertEquals(1.68, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
 
             // New crash 1.22x (<= 2.00 -> LOSS #1): Crash=1.22, pill[0]=1.22, Last=L, Stake=40.0
-            engine.handleScreenEvent(ScreenMap(timestampMs = 5000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertEquals(1.22, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
             assertEquals(1.22, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
             assertEquals(40.0, engine.state.value.currentStake, 0.01)
             assertEquals(1, engine.state.value.consecutiveLosses)
 
             // New crash 1.11x (<= 2.00 -> LOSS #2): Crash=1.11, pill[0]=1.11, Last=L L, Stake=80.0
-            engine.handleScreenEvent(ScreenMap(timestampMs = 9000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.11, 1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.11, 1.22, 1.68, 2.50), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertEquals(1.11, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
             assertEquals(1.11, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
             assertEquals(80.0, engine.state.value.currentStake, 0.01)
@@ -513,8 +542,9 @@ class BetManagerVerificationTest {
             assertEquals(listOf(false, false), lastFive.mapNotNull { it.won })
 
             // Crash exactly 2.00x (<= 2.00 -> LOSS #3): hits stopAfterLosses=3 and stops immediately
-            engine.handleScreenEvent(ScreenMap(timestampMs = 13_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertFalse("Engine must stop immediately when consecutive losses reach limit", engine.state.value.isRunning)
             assertEquals(20.0, engine.state.value.currentStake, 0.01)
             assertEquals(0, engine.state.value.consecutiveLosses)
@@ -523,14 +553,18 @@ class BetManagerVerificationTest {
             // Restart and test > 2.00x WIN resets doubled stake to 20.0 and 0 losses
             engine.start()
             runCurrent()
-            engine.handleScreenEvent(ScreenMap(timestampMs = 15_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
-            engine.handleScreenEvent(ScreenMap(timestampMs = 19_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.30, 2.00, 1.11, 1.22), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(2000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.30, 2.00, 1.11, 1.22), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertEquals(40.0, engine.state.value.currentStake, 0.01)
             assertEquals(1, engine.state.value.consecutiveLosses)
 
-            engine.handleScreenEvent(ScreenMap(timestampMs = 23_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.01, 1.30, 2.00, 1.11), stakeField = stakeTarget, betButton = betTarget))
-            runCurrent()
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.01, 1.30, 2.00, 1.11), stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
             assertEquals(20.0, engine.state.value.currentStake, 0.01)
             assertEquals(0, engine.state.value.consecutiveLosses)
 
@@ -837,5 +871,355 @@ class BetManagerVerificationTest {
         assertEquals(listOf(1.68), next.newCrashMultipliers)
         assertEquals(1, next.monitoredCrashCount)
         assertEquals(1.68, next.latestCrashMultiplier ?: 0.0, 0.001)
+    }
+
+    @Test
+    fun `martingale 1000 to 2000 to 4000 to 8000 respects stopAfterLosses=4, resets on win, and syncs strategy config and restart`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        try {
+            context.getSharedPreferences("betmanager_state", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 1000.0,
+                    cashOutTarget = 2.0,
+                    afterLoss = AfterLossMode.DOUBLE,
+                    stopAfterLosses = 4,
+                    bettingMode = BettingMode.USE_STRATEGY_RULES
+                ).normalized()
+            )
+            repo.saveCustomStrategy(
+                CustomPatternStrategy(
+                    name = "Single Blue < 2x",
+                    isEnabled = true,
+                    strategyGroup = StrategyGroup.COLOR_SEQUENCE,
+                    strategyMode = StrategyMode.STRATEGY_C_COLOR_PATTERNS,
+                    colorMatchDirection = ColorMatchDirection.HORIZONTAL,
+                    colorSequenceCsv = CrashColorCategory.Blue.name
+                )
+            )
+
+            val platform = FakeVerificationPlatform(clockMs = { testScheduler.currentTime })
+            val stakeTarget = UiTarget("stake", RectBounds(140, 1120, 380, 1200), text = "20.00", isEditable = true, isClickable = true)
+            val betTarget = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
+            platform.focusedTarget = stakeTarget
+            platform.confirmOnPoll = true
+            platform.screenMapProvider = {
+                ScreenMap(
+                    timestampMs = testScheduler.currentTime,
+                    packageName = "com.android.chrome",
+                    phase = GamePhase.BETTING_OPEN,
+                    stakeField = stakeTarget,
+                    betButton = betTarget
+                )
+            }
+
+            val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
+            engine.attachAccessibility(AutoTouchDriver(platform), ScanScheduler(platform, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
+            engine.start()
+            runCurrent()
+            val startDeadlineMs = System.currentTimeMillis() + 3000L
+            while (engine.state.value.currentStake != 1000.0 && System.currentTimeMillis() < startDeadlineMs) {
+                Thread.sleep(15L)
+                runCurrent()
+            }
+
+            fun snapshot(ribbon: List<Double>, phase: GamePhase = GamePhase.BETTING_OPEN, hasCancel: Boolean = false) =
+                ScreenMap(
+                    timestampMs = testScheduler.currentTime,
+                    packageName = "com.android.chrome",
+                    phase = phase,
+                    ribbonMultipliers = ribbon,
+                    stakeField = stakeTarget,
+                    betButton = if (hasCancel || phase != GamePhase.BETTING_OPEN) null else betTarget,
+                    cancelButton = if (hasCancel) UiTarget("cancel", RectBounds(520, 1100, 980, 1240), text = "Cancel", isClickable = true) else null
+                )
+
+            // 1. Baseline high crash -> no bet
+            testScheduler.advanceTimeBy(1000L)
+            engine.handleScreenEvent(snapshot(listOf(3.10, 4.20)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertTrue(platform.setTextHistory.isEmpty())
+
+            // 2. Passive high crash (5.10x) -> no signal, no bet, stake unchanged
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(5.10, 3.10, 4.20)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertTrue(platform.setTextHistory.isEmpty())
+
+            // 3. Qualifying Blue crash 1.40x triggers Bet #1 at 1,000.00
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.40, 5.10, 3.10)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(listOf("1000.00"), platform.setTextHistory)
+            assertTrue(engine.hasActiveBetLock())
+
+            // 4. Bet #1 settles LOSS at 1.25x (which ALSO triggers Bet #2 immediately at 2,000.00!)
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.25, 1.40, 5.10)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(2000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(2000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+            assertEquals(listOf("1000.00", "2000.00"), platform.setTextHistory)
+
+            // 5. Bet #2 settles LOSS at 1.50x -> Bet #3 executes 4,000.00 immediately
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.50, 1.25, 1.40)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(4000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(4000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            assertEquals(2, engine.state.value.consecutiveLosses)
+            assertEquals(listOf("1000.00", "2000.00", "4000.00"), platform.setTextHistory)
+
+            // 6. Bet #3 settles LOSS at 1.80x -> Bet #4 executes 8,000.00 immediately (must NOT stop at 2 or 3!)
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.80, 1.50, 1.25)))
+            testScheduler.advanceUntilIdle()
+            assertTrue("Must continue to 4th step when stopAfterLosses=4", engine.state.value.isRunning)
+            assertEquals(8000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(8000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            assertEquals(3, engine.state.value.consecutiveLosses)
+            assertEquals(listOf("1000.00", "2000.00", "4000.00", "8000.00"), platform.setTextHistory)
+
+            // 7. Bet #4 settles LOSS at 1.15x -> hits stopAfterLosses=4 -> stops and resets to 1,000.00
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.15, 1.80, 1.50)))
+            testScheduler.advanceUntilIdle()
+            assertFalse("Engine must stop at stopAfterLosses=4", engine.state.value.isRunning)
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertEquals(0.0, engine.state.value.recoveryDeficit, 0.01)
+
+            // 8. Restart engine, reach 4,000, win at 2.50x -> must reset to 1,000 and next qualifying signal bets 1,000
+            engine.start()
+            runCurrent()
+            testScheduler.advanceTimeBy(1000L)
+            engine.handleScreenEvent(snapshot(listOf(1.15, 1.80, 1.50)))
+            testScheduler.advanceUntilIdle()
+
+            // Signal 1.30x -> Bet 1,000
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.30, 1.15, 1.80)))
+            testScheduler.advanceUntilIdle()
+            // Loss 1.45x -> Bet 2,000
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.45, 1.30, 1.15)))
+            testScheduler.advanceUntilIdle()
+            // Loss 1.60x -> Bet 4,000
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.60, 1.45, 1.30)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(4000.0, engine.state.value.currentStake, 0.01)
+
+            // Win at 2.60x (> 2.00x) -> resets to 1,000 and 0 losses
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(2.60, 1.60, 1.45)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertEquals(0.0, engine.state.value.recoveryDeficit, 0.01)
+
+            // Passive crashes after win do NOT advance Martingale
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(3.20, 2.60, 1.60)))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+
+            // Next qualifying signal (1.20x) bets 1,000.00 (base stake)
+            testScheduler.advanceTimeBy(4000L)
+            engine.handleScreenEvent(snapshot(listOf(1.20, 3.20, 2.60)))
+            testScheduler.advanceUntilIdle()
+            assertEquals("1000.00", platform.setTextHistory.last())
+
+            // Verify overlay stake formatting stays synchronized with EngineUiState & persisted stake
+            assertEquals("1000.00", StakeCalculator.formatStake(engine.state.value.currentStake))
+            assertEquals("1000.00", StakeCalculator.formatStake(repo.getSavedCurrentStake(1000.0)))
+
+            // App restart (new AutomationEngine after win/reset or stale pref) does not restore stale stake
+            engine.stopForExit()
+            runCurrent()
+            repo.saveSessionProgression(currentStake = 8000.0, consecutiveLosses = 0, recoveryDeficit = 0.0)
+            val restartedEngine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
+            runCurrent()
+            val restartDeadlineMs = System.currentTimeMillis() + 3000L
+            while (repo.getSavedCurrentStake(1000.0) != 1000.0 && System.currentTimeMillis() < restartDeadlineMs) {
+                Thread.sleep(15L)
+                runCurrent()
+            }
+            assertEquals(1000.0, restartedEngine.state.value.currentStake, 0.01)
+            assertEquals(0, restartedEngine.state.value.consecutiveLosses)
+            assertEquals(1000.0, repo.getSavedCurrentStake(1000.0), 0.01)
+            restartedEngine.stopForExit()
+            runCurrent()
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `unconfirmed bet, passive crash, and duplicate multi-crash batch never advance Martingale`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        try {
+            context.getSharedPreferences("betmanager_state", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 1000.0,
+                    cashOutTarget = 2.0,
+                    afterLoss = AfterLossMode.DOUBLE,
+                    stopAfterLosses = 5,
+                    bettingMode = BettingMode.BET_EVERY_ROUND
+                ).normalized()
+            )
+            val platform = FakeVerificationPlatform(clockMs = { testScheduler.currentTime })
+            val stakeTarget = UiTarget("stake", RectBounds(140, 1120, 380, 1200), text = "20.00", isEditable = true, isClickable = true)
+            val betTarget = UiTarget("bet_btn", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true)
+            var currentPhase = GamePhase.BETTING_OPEN
+            var currentRibbon = listOf(2.50, 3.00)
+            platform.focusedTarget = stakeTarget
+            platform.confirmOnPoll = false // First bet attempts do NOT confirm!
+            platform.screenMapProvider = {
+                ScreenMap(
+                    timestampMs = testScheduler.currentTime,
+                    packageName = "com.android.chrome",
+                    phase = currentPhase,
+                    ribbonMultipliers = currentRibbon,
+                    stakeField = stakeTarget,
+                    betButton = if (currentPhase == GamePhase.BETTING_OPEN) betTarget else null
+                )
+            }
+
+            val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
+            engine.attachAccessibility(AutoTouchDriver(platform), ScanScheduler(platform, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
+            engine.start()
+            runCurrent()
+            val startDeadlineMs = System.currentTimeMillis() + 3000L
+            while (engine.state.value.currentStake != 1000.0 && System.currentTimeMillis() < startDeadlineMs) {
+                Thread.sleep(15L)
+                runCurrent()
+            }
+
+            // Baseline + unconfirmed bet attempt
+            testScheduler.advanceTimeBy(1000L)
+            currentPhase = GamePhase.BETTING_OPEN
+            currentRibbon = listOf(2.50, 3.00)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = currentPhase, ribbonMultipliers = currentRibbon, stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
+            assertFalse(engine.hasActiveBetLock())
+
+            // Crash arrives at 1.20x after unconfirmed bet -> must NOT double!
+            testScheduler.advanceTimeBy(4000L)
+            currentRibbon = listOf(1.20, 2.50, 3.00)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = currentRibbon, stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertEquals(0.0, repo.getTodayProfit(), 0.001)
+            assertTrue(repo.lastFiveBetResultsFlow.first().isEmpty())
+
+            // Round flies passively (IN_FLIGHT), drains any in-flight unconfirmed polls cleanly before allowing confirmation
+            currentPhase = GamePhase.IN_FLIGHT
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.IN_FLIGHT, ribbonMultipliers = currentRibbon))
+            testScheduler.advanceTimeBy(4000L)
+            testScheduler.advanceUntilIdle()
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+
+            // Passive crash 1.10x opens next betting window; now allow confirmation and place ONE confirmed 1,000 bet
+            platform.confirmOnPoll = true
+            currentPhase = GamePhase.BETTING_OPEN
+            currentRibbon = listOf(1.10, 1.20, 2.50)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = currentRibbon, stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
+            assertTrue(engine.hasActiveBetLock())
+            assertEquals(1000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+
+            // Batch of 2 new crashes [1.30, 1.40] arrives -> confirms active bet settled ONCE (1000 -> 2000, not 4000!)
+            testScheduler.advanceTimeBy(4000L)
+            currentRibbon = listOf(1.30, 1.40, 1.10, 1.20)
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = currentRibbon, stakeField = stakeTarget, betButton = betTarget))
+            testScheduler.advanceUntilIdle()
+            assertEquals(2000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+
+            // Same CRASHED 1.30x repeated must not double-settle
+            currentPhase = GamePhase.CRASHED
+            engine.handleScreenEvent(ScreenMap(timestampMs = testScheduler.currentTime + 500L, packageName = "com.android.chrome", phase = GamePhase.CRASHED, lastCrashMultiplier = 1.30, ribbonMultipliers = currentRibbon))
+            testScheduler.advanceUntilIdle()
+            assertEquals(2000.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+
+            engine.stopForExit()
+            runCurrent()
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `resetForNewSession clears outdated progression and ViewModel config preserves normalized single authority`() = runTest {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(app, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        try {
+            app.getSharedPreferences("betmanager_state", android.content.Context.MODE_PRIVATE).edit().clear().commit()
+            val repo = BetManagerRepository(app, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 500.0,
+                    afterLoss = AfterLossMode.DOUBLE,
+                    stopAfterLosses = 6,
+                    // Stale legacy mirrors must not override afterLoss=DOUBLE
+                    lossProgressionEnabled = false,
+                    lossProgressionMode = StakeProgressionMode.DISABLED
+                ).normalized()
+            )
+            assertEquals(AfterLossMode.DOUBLE, repo.getConfig().afterLoss)
+            assertTrue(repo.getConfig().isMartingaleEnabled)
+
+            repo.saveSessionProgression(currentStake = 4000.0, consecutiveLosses = 3, recoveryDeficit = 3500.0)
+            val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
+            runCurrent()
+            val initDeadlineMs = System.currentTimeMillis() + 3000L
+            while (engine.state.value.consecutiveLosses != 3 && System.currentTimeMillis() < initDeadlineMs) {
+                Thread.sleep(15L)
+                runCurrent()
+            }
+            assertEquals(4000.0, engine.state.value.currentStake, 0.01)
+
+            engine.resetForNewSession()
+            runCurrent()
+            assertEquals(500.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertEquals(0.0, engine.state.value.recoveryDeficit, 0.01)
+            assertEquals(500.0, repo.getSavedCurrentStake(500.0), 0.01)
+            assertEquals(0, repo.getConsecutiveLosses())
+        } finally {
+            db.close()
+        }
     }
 }

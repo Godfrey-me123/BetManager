@@ -1,0 +1,1702 @@
+package com.example.data.engine
+
+import com.example.data.local.BetManagerRepository
+import com.example.data.model.AfterLossMode
+import com.example.data.model.BettingMode
+import com.example.data.model.CalendarHourUtils
+import com.example.data.model.CollectionSource
+import com.example.data.model.ColorClassifier
+import com.example.data.model.CrashRecord
+import com.example.data.model.LogCategory
+import com.example.data.model.MultiplierRecord
+import com.example.data.model.RoundRecord
+import com.example.data.model.StrategyConfig
+import com.example.data.model.StrategyNotificationType
+import com.example.service.AlarmAudioController
+import com.example.service.AutoTouchDriver
+import com.example.service.GamePhase
+import com.example.service.RectBounds
+import com.example.service.ScanReason
+import com.example.service.ScanScheduler
+import com.example.service.ScreenMap
+import com.example.service.StrategyNotificationManager
+import com.example.service.SwitchState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+enum class FloatingHandState {
+    WAITING,
+    READY,
+    LOCKED
+}
+
+data class ActiveBetRecord(
+    val roundSignature: String,
+    val stake: Double,
+    val targetMultiplier: Double = 2.0,
+    val strategyName: String?,
+    val placedAtMs: Long = System.currentTimeMillis(),
+    val balanceBeforeBet: Double? = null,
+    val balanceAfterConfirm: Double? = null,
+    val autoCashOutStateAtBet: SwitchState = SwitchState.UNREADABLE,
+    val autoCashOutTargetAtBet: Double? = null,
+    val observedCashOutMultiplier: Double? = null,
+    val observedWinAmount: Double? = null,
+    val latestObservedBalance: Double? = null
+)
+
+data class EngineUiState(
+    val isRunning: Boolean = false,
+    val serviceConnected: Boolean = false,
+    val statusLine: String = "Stopped: press Start to watch the game",
+    val gameName: String = "Aviator",
+    val siteUrl: String = "BetPawa",
+    val balance: Double? = null,
+    val currency: String = "TZS",
+    val currentStake: Double = 20.0,
+    val consecutiveLosses: Int = 0,
+    val phase: GamePhase = GamePhase.UNKNOWN,
+    val liveMultiplier: Double? = null,
+    val latestCrashMultiplier: Double? = null,
+    val monitoredCrashCount: Int = 0,
+    val monitorStatusLabel: String = "Idle",
+    val betTargetDetected: Boolean = false,
+    val betTargetSummary: String = "Drag BET hand onto game Bet button",
+    val handAutoBetEnabled: Boolean = false,
+    val handState: FloatingHandState = FloatingHandState.WAITING,
+    val handStatusText: String = "Waiting",
+    val lastRoundId: String? = null,
+    val recordedMultipliers: List<Double> = emptyList(),
+    val patternProgress: PatternProgress = PatternProgress(),
+    val patternSignalStage: PatternSignalStage = PatternSignalStage.NONE,
+    val isPatternMatched: Boolean = false,
+    val activeStrategyName: String? = null,
+    val isAlarmActive: Boolean = false,
+    val activeAlarmTitle: String? = null,
+    val afterLossMode: AfterLossMode = AfterLossMode.DOUBLE,
+    val targetMultiplier: Double = 2.0,
+    val recoveryDeficit: Double = 0.0
+)
+
+/**
+ * Coordinates live crash multiplier monitoring, strategy evaluation, BetSequence execution,
+ * round settlement, and draggable floating BET hand detection/locking/auto-betting.
+ * Never wipes saved history/rules/configuration on stop or restart.
+ */
+class AutomationEngine(
+    private val repository: BetManagerRepository,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+) {
+    private val _state = MutableStateFlow(EngineUiState())
+    val state: StateFlow<EngineUiState> = _state.asStateFlow()
+
+    var patternAlertManager: com.example.service.PatternAlertManager? = null
+    var strategyNotificationManager: StrategyNotificationManager? = null
+    private val liveRecordedMultipliers = mutableListOf<Double>()
+    private val consumedPatternSignatures = mutableSetOf<String>()
+    private val settledBetSignatures = mutableSetOf<String>()
+
+    private val sequenceMutex = Mutex()
+    private val scanMutex = Mutex()
+    private val crashTracker = CrashMonitorTracker()
+    private val patternDetectionEngine = PatternDetectionEngine()
+
+    private var scheduler: ScanScheduler? = null
+    private var driver: AutoTouchDriver? = null
+    private var betSequence: BetSequence? = null
+
+    private var activeBet: ActiveBetRecord? = null
+    private var pendingSettlementBet: ActiveBetRecord? = null
+    private var pendingCreatedAtMs: Long = 0L
+    /** Serialises every read-modify-write of stake / loss streak / deficit (single writer rule). */
+    private val progressionLock = Mutex()
+    private var isBetActionPending: Boolean = false
+    private var engineStartedAtMs: Long = 0L
+    private var alarmObserverJob: kotlinx.coroutines.Job? = null
+    private var timerTickJob: kotlinx.coroutines.Job? = null
+    private var initJob: kotlinx.coroutines.Job? = null
+    private var startJob: kotlinx.coroutines.Job? = null
+    private var lockedRoundKey: String? = null
+    private var lockedAtMs: Long = 0L
+    private var sawCancelOrFlightAfterBet: Boolean = false
+    private var previousPhase: GamePhase = GamePhase.UNKNOWN
+    private var roundCounter: Long = 0L
+    private var calibratedBetBounds: RectBounds? = repository.getCalibratedBetBounds()
+    private var calibratedHandBounds: RectBounds? = repository.getCalibratedHandBounds()
+
+    fun activeTargetBounds(): RectBounds? = calibratedBetBounds ?: calibratedHandBounds
+
+    fun hasActiveBetLock(): Boolean = activeBet != null || lockedRoundKey != null || pendingSettlementBet != null || isBetActionPending
+
+    fun markSignatureConsumed(signature: String) {
+        if (signature.isNotBlank()) {
+            consumedPatternSignatures.add(signature)
+        }
+    }
+
+    suspend fun setCustomStrategyEnabledWithBaseline(
+        strategy: com.example.data.model.CustomPatternStrategy,
+        enabled: Boolean
+    ) {
+        if (enabled) {
+            val crashes = repository.getCrashRecords()
+            val latestCrashKey = crashes.lastOrNull()?.dedupKey
+            val baselineKey = if (latestCrashKey != null) "baseline_${strategy.id}_$latestCrashKey" else null
+            val enabledStrat = strategy.copy(
+                isEnabled = true,
+                currentlyReached = false,
+                currentlyApproaching = false,
+                lastEvaluatedRecordKey = latestCrashKey,
+                lastTriggeredOccurrenceKey = baselineKey ?: strategy.lastTriggeredOccurrenceKey
+            )
+            repository.updateCustomStrategy(enabledStrat)
+            if (crashes.isNotEmpty()) {
+                val cfg = repository.getConfig()
+                val batch = patternDetectionEngine.evaluateStrategiesOnCrashRecords(
+                    strategies = listOf(enabledStrat.copy(lastEvaluatedRecordKey = null)),
+                    crashRecords = crashes,
+                    lowThreshold = cfg.lowThreshold,
+                    bigThreshold = cfg.bigThreshold
+                )
+                batch.events.forEach { ev ->
+                    repository.saveConsumedTriggerSignature(ev.occurrenceKey)
+                    markSignatureConsumed(ev.occurrenceKey)
+                }
+            }
+            baselineKey?.let { markSignatureConsumed(it) }
+        } else {
+            repository.updateCustomStrategy(
+                strategy.copy(
+                    isEnabled = false,
+                    currentlyReached = false,
+                    currentlyApproaching = false
+                )
+            )
+        }
+        repository.log(
+            LogCategory.STRATEGY,
+            "${strategy.name} ${if (enabled) "enabled" else "disabled"}"
+        )
+    }
+
+    suspend fun consumeBaselineForRule(rule: com.example.data.model.StrategyRule) {
+        val recentRounds = repository.getRecentRounds()
+        val nowMs = System.currentTimeMillis()
+        val progFromRounds = StrategyEvaluator.computeRuleProgress(rule, recentRounds, consumedPatternSignatures, nowMs)
+        if (progFromRounds.isMatched && progFromRounds.triggerSignature.isNotBlank()) {
+            consumedPatternSignatures.add(progFromRounds.triggerSignature)
+            repository.saveConsumedTriggerSignature(progFromRounds.triggerSignature)
+        }
+        if (liveRecordedMultipliers.isNotEmpty()) {
+            val total = liveRecordedMultipliers.size
+            val synthetic = liveRecordedMultipliers.mapIndexed { idx, m ->
+                RoundRecord(
+                    roundId = "M-${total - 1 - idx}",
+                    timestampMs = nowMs - idx * 5000L,
+                    crashMultiplier = m
+                )
+            }
+            val progFromLive = StrategyEvaluator.computeRuleProgress(rule, synthetic, consumedPatternSignatures, nowMs)
+            if (progFromLive.isMatched && progFromLive.triggerSignature.isNotBlank()) {
+                consumedPatternSignatures.add(progFromLive.triggerSignature)
+                repository.saveConsumedTriggerSignature(progFromLive.triggerSignature)
+            }
+        }
+    }
+
+    init {
+        initJob = scope.launch {
+            repository.ensureInitialized()
+            // A NEW PROCESS IS A NEW LAUNCH: drop every leftover of the previous play session first.
+            runCatching { repository.clearSessionData() }
+            calibratedBetBounds = null
+            calibratedHandBounds = null
+            val config = repository.getConfig()
+            val savedStake = repository.getSavedCurrentStake(config.baseStake)
+            val savedLosses = repository.getConsecutiveLosses()
+            val savedDeficit = repository.getSavedRecoveryDeficit()
+            val handAutoBet = repository.isHandAutoBetEnabled()
+            val hasTarget = (calibratedBetBounds ?: calibratedHandBounds) != null
+            consumedPatternSignatures.addAll(repository.getConsumedTriggerSignatures())
+            _state.update {
+                it.copy(
+                    currentStake = savedStake,
+                    consecutiveLosses = savedLosses,
+                    recoveryDeficit = savedDeficit,
+                    handAutoBetEnabled = handAutoBet,
+                    afterLossMode = config.afterLoss,
+                    targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01),
+                    betTargetDetected = hasTarget,
+                    betTargetSummary = if (hasTarget) {
+                        "Bet target calibrated"
+                    } else {
+                        "Drag BET hand onto game Bet button"
+                    }
+                )
+            }
+        }
+        startAlarmStateObserver()
+        startPeriodicTimerTick()
+    }
+
+    private fun isTestCoroutineScope(): Boolean {
+        val interceptorName = scope.coroutineContext[kotlin.coroutines.ContinuationInterceptor]?.javaClass?.name.orEmpty()
+        return interceptorName.contains("TestDispatcher") || interceptorName.contains("TestCoroutine")
+    }
+
+    private fun startPeriodicTimerTick() {
+        if (isTestCoroutineScope()) return
+        timerTickJob?.cancel()
+        timerTickJob = scope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(5_000L)
+                runCatching { tickTimeSchedules(System.currentTimeMillis()) }
+            }
+        }
+    }
+
+    suspend fun tickTimeSchedules(nowMs: Long = System.currentTimeMillis()) {
+        val config = repository.getConfig()
+        val customStrategies = repository.getCustomStrategies()
+        if (customStrategies.isEmpty()) return
+        val crashes = repository.getCrashRecords()
+        val timeBatch = patternDetectionEngine.evaluateTimeSchedulesTick(
+            strategies = customStrategies,
+            crashRecords = crashes,
+            bigThreshold = config.bigThreshold,
+            nowMs = nowMs
+        )
+        val byId = customStrategies.associateBy { it.id }
+        timeBatch.updatedStrategies.forEach { upd ->
+            if (byId[upd.id] != upd) {
+                repository.updateCustomStrategy(upd)
+            }
+        }
+        if (timeBatch.newOccurrences.isNotEmpty()) {
+            repository.recordPatternOccurrences(timeBatch.newOccurrences)
+        }
+        if (timeBatch.events.isNotEmpty()) {
+            val settings = repository.getNotificationSettings()
+            timeBatch.events.forEach { ev ->
+                strategyNotificationManager?.dispatchPatternAlert(ev, settings, nowMs)
+            }
+        }
+    }
+
+    fun attachStrategyNotificationManager(manager: StrategyNotificationManager) {
+        this.strategyNotificationManager = manager
+    }
+
+    fun attachPatternAlertManager(manager: com.example.service.PatternAlertManager) {
+        this.patternAlertManager = manager
+        startAlarmStateObserver()
+    }
+
+    private fun startAlarmStateObserver() {
+        alarmObserverJob?.cancel()
+        val mgr = patternAlertManager
+        alarmObserverJob = scope.launch {
+            if (mgr != null) {
+                kotlinx.coroutines.flow.combine(
+                    mgr.isAlarmActiveFlow,
+                    mgr.activeAlarmTitleFlow,
+                    AlarmAudioController.isAlarmRinging,
+                    AlarmAudioController.activeAlarmTitle
+                ) { mgrActive, mgrTitle, audioActive, audioTitle ->
+                    val anyActive = mgrActive || audioActive
+                    val title = mgrTitle ?: audioTitle
+                    anyActive to title
+                }.collect { (active, title) ->
+                    _state.update { it.copy(isAlarmActive = active, activeAlarmTitle = title) }
+                }
+            } else {
+                kotlinx.coroutines.flow.combine(
+                    AlarmAudioController.isAlarmRinging,
+                    AlarmAudioController.activeAlarmTitle
+                ) { audioActive, audioTitle ->
+                    audioActive to audioTitle
+                }.collect { (active, title) ->
+                    _state.update { it.copy(isAlarmActive = active, activeAlarmTitle = title) }
+                }
+            }
+        }
+    }
+
+    fun cancelActiveAlarm() {
+        patternAlertManager?.cancelAlarm()
+        AlarmAudioController.stopAlarm()
+        _state.update { it.copy(isAlarmActive = false, activeAlarmTitle = null) }
+        scope.launch {
+            repository.log(LogCategory.STRATEGY, "Alarm silenced by user")
+        }
+    }
+
+    fun syncStakeWithConfig(resetProgression: Boolean = false) {
+        scope.launch {
+            initJob?.join()
+            val config = repository.getConfig()
+            val safeTarget = config.cashOutTarget.coerceAtLeast(1.01)
+            // FIX(martingale): read the progression state INSIDE the lock. The old code took a snapshot first and
+            // wrote it back later, which could undo a loss that was settled in between (stake went back down).
+            progressionLock.withLock {
+                val curState = _state.value
+                val inRecovery = curState.consecutiveLosses > 0 || curState.recoveryDeficit > 0.01
+                val betLive = activeBet != null || pendingSettlementBet != null
+                // A reset request never wipes a recovery that is in progress while the bot runs or a bet is live.
+                val allowReset = resetProgression && !(curState.isRunning && inRecovery) && !betLive
+                val idleReset = !curState.isRunning && !inRecovery && !betLive
+                val updatedStake = if (allowReset || idleReset) config.baseStake else curState.currentStake
+                val updatedLosses = if (allowReset) 0 else curState.consecutiveLosses
+                val updatedDeficit = if (allowReset) 0.0 else curState.recoveryDeficit
+                if (allowReset) {
+                    repository.saveSessionProgression(updatedStake, 0, 0.0)
+                }
+                _state.update {
+                    it.copy(
+                        currentStake = updatedStake,
+                        consecutiveLosses = updatedLosses,
+                        recoveryDeficit = updatedDeficit,
+                        afterLossMode = config.afterLoss,
+                        targetMultiplier = safeTarget
+                    )
+                }
+            }
+        }
+    }
+
+    fun attachAccessibility(driver: AutoTouchDriver, scheduler: ScanScheduler) {
+        this.driver = driver
+        this.scheduler = scheduler
+        this.betSequence = BetSequence(
+            driver = driver,
+            scheduler = scheduler,
+            onLog = { cat, msg, details -> repository.log(cat, msg, details) }
+        )
+        _state.update { it.copy(serviceConnected = true) }
+    }
+
+    fun detachAccessibility() {
+        stop("accessibility detached")
+        this.scheduler = null
+        this.driver = null
+        this.betSequence = null
+        _state.update {
+            it.copy(
+                serviceConnected = false,
+                handState = FloatingHandState.WAITING,
+                handStatusText = "Disconnected"
+            )
+        }
+    }
+
+    fun start() {
+        val currentScheduler = scheduler
+        val currentBetSeq = betSequence
+        if (currentScheduler == null || currentBetSeq == null) {
+            _state.update { it.copy(statusLine = "Error: Accessibility service not connected") }
+            return
+        }
+        if (_state.value.isRunning) return
+        engineStartedAtMs = System.currentTimeMillis()
+
+        _state.update {
+            it.copy(
+                isRunning = true,
+                monitoredCrashCount = 0,
+                monitorStatusLabel = "Capturing baseline",
+                statusLine = "Looking at the game...",
+                handState = FloatingHandState.WAITING,
+                handStatusText = "Scanning"
+            )
+        }
+
+        startJob?.cancel()
+        startJob = scope.launch {
+            initJob?.join()
+            val config = repository.getConfig()
+            val savedLosses = repository.getConsecutiveLosses()
+            val savedDeficit = repository.getSavedRecoveryDeficit()
+            val savedStake = if (savedLosses == 0 && savedDeficit <= 0.01 && config.resetAfterWin) {
+                config.baseStake
+            } else {
+                repository.getSavedCurrentStake(config.baseStake)
+            }
+            crashTracker.resetSession()
+            if (activeBet == null) {
+                lockedRoundKey = null
+                lockedAtMs = 0L
+                sawCancelOrFlightAfterBet = false
+            }
+
+            _state.update {
+                it.copy(
+                    isRunning = true,
+                    currentStake = savedStake,
+                    consecutiveLosses = savedLosses,
+                    recoveryDeficit = savedDeficit,
+                    monitoredCrashCount = 0,
+                    monitorStatusLabel = "Capturing baseline",
+                    statusLine = "Looking at the game...",
+                    handState = FloatingHandState.WAITING,
+                    handStatusText = "Scanning"
+                )
+            }
+            repository.log(
+                LogCategory.DETECTION,
+                "BetManager monitoring started",
+                "Base stake ${StakeCalculator.formatStake(config.baseStake)}"
+            )
+
+            // S1 full scan on start (captures initial ribbon baseline without importing old crashes)
+            val targetPanel = calibratedBetBounds ?: calibratedHandBounds
+            val firstMap = currentScheduler.runScan(ScanReason.START_S1, targetPanel)
+            processScreenMap(firstMap, allowAutoBet = true)
+
+            if (_state.value.isRunning) {
+                currentScheduler.startHeartbeat(
+                    scope = scope,
+                    intervalMs = config.scanHeartbeatMs,
+                    preferredBetPanelBoundsProvider = { calibratedBetBounds ?: calibratedHandBounds },
+                    onHeartbeatScan = { map ->
+                        processScreenMap(map, allowAutoBet = true)
+                    }
+                )
+            }
+        }
+    }
+
+    fun setHandAutoBetEnabled(enabled: Boolean) {
+        repository.setHandAutoBetEnabled(enabled)
+        _state.update { it.copy(handAutoBetEnabled = enabled) }
+        scope.launch {
+            repository.log(
+                LogCategory.STRATEGY,
+                "BET hand Auto Bet ${if (enabled) "enabled" else "disabled"}"
+            )
+        }
+        if (enabled && _state.value.serviceConnected && !_state.value.isRunning) {
+            start()
+        }
+    }
+
+    fun stop(reason: String = "paused by user") {
+        startJob?.cancel()
+        startJob = null
+        scheduler?.stopHeartbeat()
+        _state.update {
+            it.copy(
+                isRunning = false,
+                monitorStatusLabel = "Paused",
+                statusLine = "Stopped: $reason",
+                handState = if (activeBet != null) FloatingHandState.LOCKED else FloatingHandState.WAITING,
+                handStatusText = "Paused"
+            )
+        }
+        scope.launch {
+            repository.log(LogCategory.STRATEGY, "Stopped: $reason")
+        }
+    }
+
+    fun stopForExit() {
+        startJob?.cancel()
+        startJob = null
+        scheduler?.stopHeartbeat()
+        timerTickJob?.cancel()
+        timerTickJob = null
+        releaseBetLock()
+        pendingSettlementBet = null
+        pendingCreatedAtMs = 0L
+        crashTracker.resetSession()
+        patternAlertManager?.clearNotifications()
+        liveRecordedMultipliers.clear()
+        _state.update {
+            it.copy(
+                isRunning = false,
+                monitorStatusLabel = "Exited",
+                statusLine = "Exited",
+                handState = FloatingHandState.WAITING,
+                handStatusText = "Exited",
+                isAlarmActive = false,
+                activeAlarmTitle = null
+            )
+        }
+    }
+
+    /** Restarts the background time-schedule tick (stopped on exit) when the app is launched again. */
+    fun resumeAfterLaunch() {
+        startPeriodicTimerTick()
+    }
+
+    /**
+     * Full stop + wipe of the play session (called on EXIT and when the app is closed):
+     * cancels monitoring, heartbeat, timers, alarms and notifications, forgets every in-memory round/bet/lock,
+     * clears the stored session data and resets the UI state to a clean "new launch" state.
+     * User settings and strategies are kept.
+     */
+    suspend fun resetForNewSession() {
+        stopForExit()
+        scanMutex.withLock {
+            progressionLock.withLock {
+                activeBet = null
+                pendingSettlementBet = null
+                pendingCreatedAtMs = 0L
+                lockedRoundKey = null
+                lockedAtMs = 0L
+                sawCancelOrFlightAfterBet = false
+                isBetActionPending = false
+                previousPhase = GamePhase.UNKNOWN
+                roundCounter = 0L
+                liveRecordedMultipliers.clear()
+                consumedPatternSignatures.clear()
+                settledBetSignatures.clear()
+                crashTracker.resetSession()
+                calibratedBetBounds = null
+                calibratedHandBounds = null
+                runCatching { patternAlertManager?.clearNotifications() }
+                runCatching { AlarmAudioController.stopAlarm() }
+                repository.clearSessionData()
+                val cfg = repository.getConfig()
+                val connected = _state.value.serviceConnected
+                _state.value = EngineUiState(
+                    serviceConnected = connected,
+                    statusLine = "Stopped: press Start to watch the game",
+                    currentStake = cfg.baseStake,
+                    afterLossMode = cfg.afterLoss,
+                    targetMultiplier = cfg.cashOutTarget.coerceAtLeast(1.01),
+                    betTargetSummary = "Drag BET hand onto game Bet button"
+                )
+            }
+        }
+    }
+
+    private fun releaseBetLock() {
+        activeBet = null
+        lockedRoundKey = null
+        lockedAtMs = 0L
+        sawCancelOrFlightAfterBet = false
+    }
+
+    /**
+     * Releases leftover activeBet / lockedRoundKey when the live game UI or phase transition
+     * confirms no bet is currently active (e.g., Cancel is gone & Bet is enabled in BETTING_OPEN,
+     * plane flew & returned to BETTING_OPEN without a readable crash text, or fallback timeout).
+     * Preserves any just-finished activeBet in [pendingSettlementBet] so if the game ribbon
+     * updates 1 scan later, the loss/win still settles cleanly for Double / Add / Keep progression.
+     */
+    private fun clearStaleBetLockIfNeeded(
+        map: ScreenMap,
+        nowMs: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (activeBet == null && lockedRoundKey == null) return false
+
+        if (map.cancelButton != null || map.phase == GamePhase.IN_FLIGHT || map.phase == GamePhase.CRASHED) {
+            sawCancelOrFlightAfterBet = true
+        }
+        // If Cancel button is actively visible for the panel, the bet is genuinely still active.
+        if (map.cancelButton != null) return false
+
+        val refTs = activeBet?.placedAtMs ?: lockedAtMs
+        val elapsedMs = if (refTs > 0L) nowMs - refTs else Long.MAX_VALUE
+        val transitionedToNewBetting = map.phase == GamePhase.BETTING_OPEN &&
+            (previousPhase == GamePhase.IN_FLIGHT || previousPhase == GamePhase.CRASHED)
+        val openBetButtonProvesIdle = map.phase == GamePhase.BETTING_OPEN &&
+            map.betButton?.isEnabled == true &&
+            (sawCancelOrFlightAfterBet || elapsedMs >= 2_500L)
+        val canvasFallbackCleared = map.betButton == null &&
+            map.phase != GamePhase.IN_FLIGHT &&
+            ((sawCancelOrFlightAfterBet && map.phase == GamePhase.BETTING_OPEN) || elapsedMs >= 12_000L)
+
+        if (transitionedToNewBetting || openBetButtonProvesIdle || canvasFallbackCleared) {
+            val currentActive = activeBet
+            if (currentActive != null && (sawCancelOrFlightAfterBet || elapsedMs >= 1_500L)) {
+                pendingSettlementBet = currentActive
+                pendingCreatedAtMs = nowMs
+            }
+            releaseBetLock()
+            return true
+        }
+        return false
+    }
+
+    suspend fun handleScreenEvent(map: ScreenMap) {
+        initJob?.join()
+        startJob?.join()
+        processScreenMap(map, allowAutoBet = _state.value.isRunning)
+    }
+
+    /**
+     * Called when user drags the floating BET hand over the game screen and drops it.
+     * Scans accessibility nodes under [handBounds] to detect the game's Bet button,
+     * saves calibration (or falls back to hand coordinates over active game windows),
+     * and executes the verified Edit Stake & Bet real touch click.
+     */
+    fun onBetHandDraggedAndDropped(
+        handBounds: RectBounds,
+        onResult: ((Boolean, String) -> Unit)? = null
+    ) {
+        val currentDriver = driver
+        val currentScheduler = scheduler
+        if (!_state.value.serviceConnected || currentDriver == null || currentScheduler == null) {
+            onResult?.invoke(false, "Enable BetManager Accessibility Service first")
+            return
+        }
+
+        scope.launch {
+            initJob?.join()
+            startJob?.join()
+            val detected = currentDriver.detectBetTargetAt(handBounds)
+            if (detected == null) {
+                val hasExternalSurface = currentDriver.hasExternalWindowAt(handBounds)
+                if (!hasExternalSurface) {
+                    repository.log(
+                        LogCategory.SKIP,
+                        "No Bet button under BET hand",
+                        "Dropped at ${handBounds.centerX.toInt()},${handBounds.centerY.toInt()}"
+                    )
+                    _state.update {
+                        it.copy(
+                            betTargetDetected = (calibratedBetBounds ?: calibratedHandBounds) != null,
+                            betTargetSummary = "No Bet button under hand — drag over Bet button"
+                        )
+                    }
+                    onResult?.invoke(false, "Drag BET hand directly over the game Bet button")
+                    return@launch
+                }
+
+                // Canvas / WebView surface without exposed button node: calibrate exact drop coordinates
+                calibratedHandBounds = handBounds
+                calibratedBetBounds = handBounds
+                repository.saveCalibratedHandBounds(handBounds.left, handBounds.top, handBounds.right, handBounds.bottom)
+                repository.saveCalibratedBetBounds(handBounds.left, handBounds.top, handBounds.right, handBounds.bottom)
+                repository.log(
+                    LogCategory.DETECTION,
+                    "BET hand coordinate target calibrated",
+                    "Center=${handBounds.centerX.toInt()},${handBounds.centerY.toInt()}"
+                )
+
+                val freshMap = currentScheduler.runScan(ScanReason.PRE_BET_S2, handBounds)
+                processScreenMap(freshMap, allowAutoBet = false)
+                _state.update {
+                    it.copy(
+                        betTargetDetected = true,
+                        betTargetSummary = "Hand target calibrated (${handBounds.centerX.toInt()}, ${handBounds.centerY.toInt()})"
+                    )
+                }
+
+                if (activeBet != null || freshMap.cancelButton != null) {
+                    onResult?.invoke(false, "Hand calibrated — round bet already active")
+                    return@launch
+                }
+                if (freshMap.phase == GamePhase.IN_FLIGHT) {
+                    onResult?.invoke(true, "Hand calibrated — waiting for next round")
+                    return@launch
+                }
+
+                executeDirectCoordinateOrButtonClick(
+                    betButton = null,
+                    fallbackBounds = handBounds,
+                    map = freshMap,
+                    strategyName = "BET Hand Drag",
+                    onResult = onResult
+                )
+                return@launch
+            }
+
+            calibratedBetBounds = detected.betButton.bounds
+            calibratedHandBounds = handBounds
+            repository.saveCalibratedBetBounds(
+                detected.betButton.bounds.left,
+                detected.betButton.bounds.top,
+                detected.betButton.bounds.right,
+                detected.betButton.bounds.bottom
+            )
+            repository.saveCalibratedHandBounds(handBounds.left, handBounds.top, handBounds.right, handBounds.bottom)
+            repository.log(
+                LogCategory.DETECTION,
+                detected.matchReason,
+                "Panel ${detected.panelIndex} bounds=${detected.betButton.bounds}"
+            )
+
+            val freshMap = currentScheduler.runScan(ScanReason.PRE_BET_S2, detected.betButton.bounds)
+            processScreenMap(freshMap, allowAutoBet = false)
+
+            _state.update {
+                it.copy(
+                    betTargetDetected = true,
+                    betTargetSummary = detected.matchReason
+                )
+            }
+
+            if (activeBet != null || freshMap.cancelButton != null) {
+                onResult?.invoke(false, "Bet button detected — round bet already active")
+                return@launch
+            }
+
+            if (freshMap.phase == GamePhase.IN_FLIGHT || freshMap.betButton?.isEnabled == false) {
+                onResult?.invoke(true, "Bet button detected — waiting for betting window")
+                return@launch
+            }
+
+            if (freshMap.stakeField != null && freshMap.phase == GamePhase.BETTING_OPEN) {
+                executeBetForMap(
+                    map = freshMap,
+                    manualOverrideDecision = StrategyDecision(true, "BET Hand Drag", detected.matchReason),
+                    isManualTrigger = true,
+                    preferredBetBounds = detected.betButton.bounds,
+                    onResult = onResult
+                )
+            } else {
+                executeDirectCoordinateOrButtonClick(
+                    betButton = freshMap.betButton ?: detected.betButton,
+                    fallbackBounds = handBounds,
+                    map = freshMap,
+                    strategyName = "BET Hand Drag",
+                    onResult = onResult
+                )
+            }
+        }
+    }
+
+    /**
+     * Triggered when user manually taps the floating BET hand.
+     * Enforces the verified BetSequence when Bet + Stake box are exposed, or real coordinate tap
+     * on the calibrated hand target when the game renders on Canvas without an editable node.
+     */
+    fun triggerManualHandBet(onResult: ((Boolean, String) -> Unit)? = null) {
+        if (!_state.value.serviceConnected) {
+            onResult?.invoke(false, "Accessibility service not connected")
+            return
+        }
+        scope.launch {
+            initJob?.join()
+            startJob?.join()
+            val targetBounds = calibratedBetBounds ?: calibratedHandBounds
+            val map = scheduler?.runScan(ScanReason.PRE_BET_S2, targetBounds)
+                ?: return@launch
+
+            processScreenMap(map, allowAutoBet = false)
+
+            if (activeBet != null || map.cancelButton != null) {
+                repository.log(LogCategory.SKIP, "Floating BET hand locked for current round")
+                onResult?.invoke(false, "Bet already active for current round")
+                return@launch
+            }
+
+            if (map.phase == GamePhase.IN_FLIGHT) {
+                onResult?.invoke(false, "Plane in flight — wait for next betting window")
+                return@launch
+            }
+
+            if (map.betButton != null && map.stakeField != null && map.phase == GamePhase.BETTING_OPEN) {
+                executeBetForMap(
+                    map = map,
+                    manualOverrideDecision = StrategyDecision(true, "Manual BET Hand", "Floating BET hand tapped"),
+                    isManualTrigger = true,
+                    preferredBetBounds = targetBounds,
+                    onResult = onResult
+                )
+            } else if (map.betButton != null && map.betButton.isEnabled) {
+                executeDirectCoordinateOrButtonClick(
+                    betButton = map.betButton,
+                    fallbackBounds = targetBounds ?: map.betButton.bounds,
+                    map = map,
+                    strategyName = "Manual BET Hand",
+                    onResult = onResult
+                )
+            } else if (targetBounds != null) {
+                executeDirectCoordinateOrButtonClick(
+                    betButton = null,
+                    fallbackBounds = targetBounds,
+                    map = map,
+                    strategyName = "Manual BET Hand",
+                    onResult = onResult
+                )
+            } else {
+                executeBetForMap(
+                    map = map,
+                    manualOverrideDecision = StrategyDecision(true, "Manual BET Hand", "Floating BET hand tapped"),
+                    isManualTrigger = true,
+                    preferredBetBounds = targetBounds,
+                    onResult = onResult
+                )
+            }
+        }
+    }
+
+    suspend fun processScreenMap(map: ScreenMap, allowAutoBet: Boolean) = scanMutex.withLock {
+        val nowMs = System.currentTimeMillis()
+        val config = repository.getConfig()
+        val rules = repository.getRules()
+
+        activeBet = enrichBetWithScreenEvidence(activeBet, map)
+        pendingSettlementBet = enrichBetWithScreenEvidence(pendingSettlementBet, map)
+
+        // FIX(martingale): a bet whose crash number was never read used to be dropped silently, so the loss
+        // was never counted and the stake never doubled. Now it is settled from the screen evidence instead.
+        val pending = pendingSettlementBet
+        if (pending != null && pendingCreatedAtMs > 0L && nowMs - pendingCreatedAtMs > 12_000L) {
+            pendingSettlementBet = null
+            pendingCreatedAtMs = 0L
+            settleWithoutCrashRead(pending, config, map)
+        }
+
+        // Track crashed multipliers whenever running OR whenever an active/pending bet awaits settlement
+        val crashUpdate = if (_state.value.isRunning || activeBet != null || pendingSettlementBet != null) {
+            crashTracker.onScreenSnapshot(map, nowMs)
+        } else {
+            CrashMonitorUpdate(
+                newCrashMultipliers = emptyList(),
+                status = crashTracker.status,
+                monitoredCrashCount = crashTracker.monitoredCrashCount,
+                latestCrashMultiplier = crashTracker.latestCrashMultiplier,
+                summary = "Paused"
+            )
+        }
+
+        // Only append newly confirmed live crashes (no bulk-importing pre-existing ribbon history)
+        val wasRunningBeforeCrash = _state.value.isRunning
+        val lastNewIdx = crashUpdate.newCrashMultipliers.lastIndex
+        crashUpdate.newCrashMultipliers.forEachIndexed { idx, crashMult ->
+            liveRecordedMultipliers.add(0, crashMult)
+            while (liveRecordedMultipliers.size > 50) {
+                liveRecordedMultipliers.removeAt(liveRecordedMultipliers.size - 1)
+            }
+            val adapter = GameAdapterRegistry.resolveForScreenMap(map)
+            val sampledHex = map.ribbonChipColors.getOrNull(idx)
+            val (colorHex, colorCat, isPixelVerified) = adapter.detectMultiplierColor(
+                pixelSampleHex = sampledHex,
+                multiplier = crashMult,
+                lowThreshold = config.lowThreshold,
+                bigThreshold = config.bigThreshold
+            )
+            val ts = nowMs + idx
+            val dedupKey = CrashRecord.buildDedupKey(
+                gameId = adapter.gameId,
+                roundIdentifier = null,
+                crashTimestamp = ts,
+                multiplier = crashMult,
+                sequenceIndex = idx
+            )
+            repository.insertConfirmedCrashIfAbsent(
+                crashRecord = CrashRecord(
+                    gameId = adapter.gameId,
+                    gameName = adapter.displayedGameName,
+                    multiplier = crashMult,
+                    detectedColorHex = colorHex,
+                    colorCategory = colorCat,
+                    isPixelColorVerified = isPixelVerified,
+                    crashTimestamp = ts,
+                    hourStartTimestamp = CalendarHourUtils.hourStartFor(ts),
+                    sourcePackage = map.packageName,
+                    dedupKey = dedupKey
+                ),
+                multiplierRecord = MultiplierRecord(
+                    gameId = adapter.gameId,
+                    multiplier = crashMult,
+                    crashTimestamp = ts,
+                    observationTimestampMs = ts,
+                    platform = map.siteUrl.ifBlank { adapter.displayedGameName },
+                    dedupKey = dedupKey,
+                    sequenceIndex = idx
+                )
+            )
+            recordCurrentCrashAndSettle(
+                crashMult = crashMult,
+                siteUrl = map.siteUrl,
+                config = config,
+                latestMap = map,
+                recordTimestampMs = ts,
+                settleBet = idx == lastNewIdx
+            )
+        }
+
+        // Evaluate user-configured CustomPatternStrategy rules + time schedules against CrashRecords
+        val customStrategies = repository.getCustomStrategies()
+        val allCrashRecords = if (customStrategies.isNotEmpty()) repository.getCrashRecords() else emptyList()
+        var updatedCustomStrategies = customStrategies
+        var customMatchedProgress: PatternProgress? = null
+        var customTriggeredDecision: StrategyDecision? = null
+        if (customStrategies.isNotEmpty()) {
+            val stratById = customStrategies.associateBy { it.id }
+            val crashBatch = if (allCrashRecords.isNotEmpty()) {
+                patternDetectionEngine.evaluateStrategiesOnCrashRecords(
+                    strategies = customStrategies,
+                    crashRecords = allCrashRecords,
+                    lowThreshold = config.lowThreshold,
+                    bigThreshold = config.bigThreshold,
+                    nowMs = nowMs
+                )
+            } else {
+                CrashPatternEvaluationBatch(customStrategies, emptyList(), emptyList())
+            }
+            val timeBatch = patternDetectionEngine.evaluateTimeSchedulesTick(
+                strategies = crashBatch.updatedStrategies,
+                crashRecords = allCrashRecords,
+                bigThreshold = config.bigThreshold,
+                nowMs = nowMs
+            )
+
+            updatedCustomStrategies = timeBatch.updatedStrategies
+            timeBatch.updatedStrategies.forEach { upd ->
+                val orig = stratById[upd.id]
+                if (orig == null || orig != upd) {
+                    repository.updateCustomStrategy(upd)
+                }
+            }
+            val allOccs = crashBatch.newOccurrences + timeBatch.newOccurrences
+            if (allOccs.isNotEmpty()) {
+                repository.recordPatternOccurrences(allOccs)
+            }
+            val allEvents = crashBatch.events + timeBatch.events
+            if (allEvents.isNotEmpty()) {
+                val notifSettings = repository.getNotificationSettings()
+                allEvents.forEach { ev ->
+                    strategyNotificationManager?.dispatchPatternAlert(ev, notifSettings, nowMs)
+                    if (ev.notificationType == StrategyNotificationType.STRATEGY_REACHED &&
+                        ev.occurrenceKey !in consumedPatternSignatures &&
+                        customTriggeredDecision == null
+                    ) {
+                        val isLiveEvent = crashUpdate.newCrashMultipliers.isNotEmpty() ||
+                            (engineStartedAtMs > 0 && ev.timestampMs >= engineStartedAtMs)
+                        customTriggeredDecision = StrategyDecision(
+                            shouldBet = isLiveEvent && config.bettingMode == BettingMode.USE_STRATEGY_RULES,
+                            triggeredRuleName = ev.strategy.name,
+                            reason = ev.message
+                        )
+                        customMatchedProgress = PatternProgress(
+                            ruleName = ev.strategy.name,
+                            matchedCount = 1,
+                            requiredCount = 1,
+                            isMatched = true,
+                            signalStage = PatternSignalStage.HIGH_SIGNAL,
+                            statusText = "PATTERN MET: ${ev.strategy.name}",
+                            triggerSignature = ev.occurrenceKey
+                        )
+                    }
+                }
+            }
+            if (customMatchedProgress == null) {
+                val activeReached = timeBatch.updatedStrategies.firstOrNull {
+                    it.isEnabled && it.currentlyReached &&
+                        !it.lastTriggeredOccurrenceKey.isNullOrBlank() &&
+                        it.lastTriggeredOccurrenceKey !in consumedPatternSignatures
+                }
+                if (activeReached != null) {
+                    val sig = activeReached.lastTriggeredOccurrenceKey!!
+                    val isLiveEvent = crashUpdate.newCrashMultipliers.isNotEmpty() ||
+                        (engineStartedAtMs > 0 && activeReached.lastNotifiedAtMs >= engineStartedAtMs)
+                    customTriggeredDecision = StrategyDecision(
+                        shouldBet = isLiveEvent && config.bettingMode == BettingMode.USE_STRATEGY_RULES,
+                        triggeredRuleName = activeReached.name,
+                        reason = "Custom strategy active: ${activeReached.summaryDescription()}"
+                    )
+                    customMatchedProgress = PatternProgress(
+                        ruleName = activeReached.name,
+                        matchedCount = 1,
+                        requiredCount = 1,
+                        isMatched = true,
+                        signalStage = PatternSignalStage.HIGH_SIGNAL,
+                        statusText = "PATTERN MET: ${activeReached.name}",
+                        triggerSignature = sig
+                    )
+                }
+            }
+        }
+
+        // Release stale bet/round locks whenever live UI or phase confirms no bet is active
+        clearStaleBetLockIfNeeded(map, nowMs)
+        previousPhase = map.phase
+
+        val recentRounds = repository.getRecentRounds()
+        val legacyEvalResult = if (liveRecordedMultipliers.isNotEmpty()) {
+            StrategyEvaluator.evaluateFromMultipliers(
+                config = config,
+                rules = rules,
+                multipliersNewestFirst = liveRecordedMultipliers,
+                consumedSignatures = consumedPatternSignatures,
+                nowMs = nowMs
+            )
+        } else {
+            StrategyEvaluator.evaluateWithProgress(
+                config = config,
+                rules = rules,
+                recentRoundsNewestFirst = recentRounds,
+                consumedSignatures = consumedPatternSignatures,
+                nowMs = nowMs
+            )
+        }
+        val hasAnyCustomStrategy = updatedCustomStrategies.isNotEmpty()
+        val hasActiveCustomStrategy = updatedCustomStrategies.any { it.isEnabled }
+        val effectiveDecision = when {
+            config.bettingMode == BettingMode.BET_EVERY_ROUND -> legacyEvalResult.decision
+            hasActiveCustomStrategy -> customTriggeredDecision ?: StrategyDecision(
+                shouldBet = false,
+                triggeredRuleName = null,
+                reason = "Waiting for qualifying live pattern"
+            )
+            hasAnyCustomStrategy -> StrategyDecision(
+                shouldBet = false,
+                triggeredRuleName = null,
+                reason = "All configured strategies are OFF"
+            )
+            rules.any { it.enabled } -> legacyEvalResult.decision
+            else -> StrategyDecision(
+                shouldBet = false,
+                triggeredRuleName = null,
+                reason = "No active strategies enabled"
+            )
+        }
+        val effectiveProgress = when {
+            config.bettingMode == BettingMode.BET_EVERY_ROUND -> legacyEvalResult.primaryProgress
+            customMatchedProgress != null -> customMatchedProgress
+            hasAnyCustomStrategy -> patternDetectionEngine.computeCustomStrategiesProgress(
+                strategies = updatedCustomStrategies,
+                crashRecords = allCrashRecords,
+                nowMs = nowMs
+            )
+            rules.any { it.enabled } -> legacyEvalResult.primaryProgress
+            else -> PatternProgress(
+                ruleName = "No Strategies",
+                matchedCount = 0,
+                requiredCount = 1,
+                isMatched = false,
+                signalStage = PatternSignalStage.NONE,
+                statusText = "No strategy configured — add one in Strategy tab"
+            )
+        }
+        val evalResult = legacyEvalResult.copy(
+            decision = effectiveDecision,
+            primaryProgress = effectiveProgress
+        )
+        val decision = evalResult.decision
+
+        // Dispatch pattern alerts: High Signal (time to bet alarm) or Pre-Signal (approaching warning)
+        patternAlertManager?.processPatternProgress(
+            progress = evalResult.primaryProgress,
+            gameSite = map.siteUrl.ifBlank { map.gameName }
+        )
+
+        val calibratedTarget = calibratedBetBounds ?: calibratedHandBounds
+        val betButtonReady = map.phase == GamePhase.BETTING_OPEN &&
+            map.cancelButton == null &&
+            (map.betButton?.isEnabled == true || (calibratedTarget != null && map.stakeField != null))
+        val handState = when {
+            activeBet != null || map.cancelButton != null -> FloatingHandState.LOCKED
+            betButtonReady && (decision.shouldBet || !_state.value.isRunning) -> FloatingHandState.READY
+            else -> FloatingHandState.WAITING
+        }
+        val handStatusText = when (handState) {
+            FloatingHandState.LOCKED -> "Locked"
+            FloatingHandState.READY -> if (evalResult.primaryProgress.isMatched) "Pattern Ready" else if (calibratedTarget != null) "Target Ready" else "Ready to Bet"
+            FloatingHandState.WAITING -> "Waiting"
+        }
+
+        val monitorLabel = when (crashUpdate.status) {
+            CrashMonitorStatus.IDLE -> if (_state.value.isRunning) "Scanning" else "Idle"
+            CrashMonitorStatus.BASELINE_CAPTURED -> "Baseline set (${crashUpdate.monitoredCrashCount} new)"
+            CrashMonitorStatus.TRACKING_LIVE -> "Live (${crashUpdate.monitoredCrashCount} crashes)"
+        }
+
+        _state.update {
+            val syncedStake = if (!it.isRunning && it.consecutiveLosses == 0 && it.recoveryDeficit <= 0.01 && config.resetAfterWin && activeBet == null && pendingSettlementBet == null) {
+                config.baseStake
+            } else {
+                it.currentStake
+            }
+            it.copy(
+                gameName = map.gameName,
+                siteUrl = map.siteUrl,
+                balance = map.balance ?: it.balance,
+                currency = map.currency,
+                currentStake = syncedStake,
+                afterLossMode = config.afterLoss,
+                targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01),
+                phase = map.phase,
+                liveMultiplier = map.liveMultiplier,
+                latestCrashMultiplier = crashUpdate.latestCrashMultiplier ?: it.latestCrashMultiplier,
+                monitoredCrashCount = crashUpdate.monitoredCrashCount,
+                monitorStatusLabel = monitorLabel,
+                handState = handState,
+                handStatusText = handStatusText,
+                lastRoundId = if (crashUpdate.newCrashMultipliers.isNotEmpty()) {
+                    "R-$roundCounter"
+                } else {
+                    it.lastRoundId
+                },
+                recordedMultipliers = liveRecordedMultipliers.toList(),
+                patternProgress = evalResult.primaryProgress,
+                patternSignalStage = evalResult.primaryProgress.signalStage,
+                isPatternMatched = evalResult.primaryProgress.isMatched && !evalResult.primaryProgress.isConsumed,
+                activeStrategyName = evalResult.primaryProgress.ruleName,
+                statusLine = if (wasRunningBeforeCrash && !it.isRunning && it.statusLine.startsWith("Stopped:")) {
+                    it.statusLine
+                } else {
+                    buildStatusLine(map, decision, crashUpdate)
+                }
+            )
+        }
+
+        val roundKey = computeRoundKey(map)
+        // Auto-bet strictly gated on running state, betting open, no active/pending bet, round unattempted, and pattern matched
+        val canAutoBet = allowAutoBet &&
+            _state.value.isRunning &&
+            map.phase == GamePhase.BETTING_OPEN &&
+            map.cancelButton == null &&
+            activeBet == null &&
+            pendingSettlementBet == null &&
+            !isBetActionPending &&
+            lockedRoundKey != roundKey &&
+            decision.shouldBet
+
+        if (canAutoBet) {
+            if (map.stakeField != null && (map.betButton != null || calibratedTarget != null)) {
+                executeBetForMap(
+                    map = map,
+                    manualOverrideDecision = null,
+                    isManualTrigger = false,
+                    preferredBetBounds = calibratedTarget ?: map.betButton?.bounds,
+                    customDecisionOverride = customTriggeredDecision,
+                    customProgressOverride = customMatchedProgress
+                )
+            }
+        }
+    }
+
+    private suspend fun executeBetForMap(
+        map: ScreenMap,
+        manualOverrideDecision: StrategyDecision?,
+        isManualTrigger: Boolean = false,
+        preferredBetBounds: RectBounds? = null,
+        customDecisionOverride: StrategyDecision? = null,
+        customProgressOverride: PatternProgress? = null,
+        onResult: ((Boolean, String) -> Unit)? = null
+    ) {
+        val seq = betSequence ?: return
+        val config = repository.getConfig()
+        val rules = repository.getRules()
+        val recentRounds = repository.getRecentRounds()
+
+        sequenceMutex.withLock {
+            val nowMs = System.currentTimeMillis()
+            clearStaleBetLockIfNeeded(map, nowMs)
+            if (activeBet != null || map.cancelButton != null || isBetActionPending) {
+                onResult?.invoke(false, "Bet already active for this round")
+                return
+            }
+
+            val evalResult = if (liveRecordedMultipliers.isNotEmpty()) {
+                StrategyEvaluator.evaluateFromMultipliers(
+                    config = config,
+                    rules = rules,
+                    multipliersNewestFirst = liveRecordedMultipliers,
+                    consumedSignatures = consumedPatternSignatures,
+                    nowMs = nowMs
+                )
+            } else {
+                StrategyEvaluator.evaluateWithProgress(
+                    config = config,
+                    rules = rules,
+                    recentRoundsNewestFirst = recentRounds,
+                    consumedSignatures = consumedPatternSignatures,
+                    nowMs = nowMs
+                )
+            }
+            val customStrategiesList = repository.getCustomStrategies()
+            val gatedLegacyOrCustom = if (manualOverrideDecision == null &&
+                customDecisionOverride == null &&
+                config.bettingMode != BettingMode.BET_EVERY_ROUND &&
+                customStrategiesList.isNotEmpty()
+            ) {
+                StrategyDecision(false, null, "Waiting for qualifying live pattern")
+            } else {
+                evalResult.decision
+            }
+            val decision = manualOverrideDecision ?: customDecisionOverride ?: gatedLegacyOrCustom
+            val effectiveProgress = customProgressOverride ?: evalResult.primaryProgress
+
+            val roundKey = computeRoundKey(map)
+            if (lockedRoundKey == roundKey) {
+                onResult?.invoke(false, "Bet already attempted for this round")
+                return
+            }
+
+            val stake = _state.value.currentStake
+            val todayProfit = repository.getTodayProfit()
+            val balanceBefore = map.balance
+
+            isBetActionPending = true
+            try {
+                val result = seq.execute(
+                    config = config,
+                    stake = stake,
+                    isRunning = _state.value.isRunning,
+                    hasActiveBet = activeBet != null,
+                    handLockedForRound = lockedRoundKey == roundKey,
+                    todayProfit = todayProfit,
+                    decision = decision,
+                    isManualTrigger = isManualTrigger,
+                    preferredBetBounds = preferredBetBounds
+                )
+
+                if (result.confirmed) {
+                    val placedAt = System.currentTimeMillis()
+                    if (effectiveProgress.triggerSignature.isNotBlank()) {
+                        consumedPatternSignatures.add(effectiveProgress.triggerSignature)
+                        repository.saveConsumedTriggerSignature(effectiveProgress.triggerSignature)
+                    }
+                    activeBet = ActiveBetRecord(
+                        roundSignature = roundKey,
+                        stake = stake,
+                        targetMultiplier = config.cashOutTarget.coerceAtLeast(1.01),
+                        strategyName = decision.triggeredRuleName,
+                        placedAtMs = placedAt,
+                        balanceBeforeBet = balanceBefore,
+                        autoCashOutStateAtBet = map.autoCashOutState,
+                        autoCashOutTargetAtBet = map.autoCashOutTarget
+                    )
+                    pendingSettlementBet = null
+                    lockedRoundKey = roundKey
+                    lockedAtMs = placedAt
+                    sawCancelOrFlightAfterBet = false
+                    markRuleTriggeredIfNeeded(rules, decision.triggeredRuleName, placedAt)
+                    _state.update {
+                        it.copy(
+                            handState = FloatingHandState.LOCKED,
+                            handStatusText = "Locked",
+                            statusLine = "Bet placed ${StakeCalculator.formatStake(stake)}"
+                        )
+                    }
+                    onResult?.invoke(true, result.reason)
+                } else {
+                    val stoppedByLimit = result.reason.startsWith("Stopped:")
+                    if (stoppedByLimit) {
+                        stop(result.reason.removePrefix("Stopped:").trim())
+                    } else {
+                        _state.update { it.copy(statusLine = result.reason) }
+                    }
+                    onResult?.invoke(false, result.reason)
+                }
+            } finally {
+                isBetActionPending = false
+            }
+        }
+    }
+
+    private suspend fun executeDirectCoordinateOrButtonClick(
+        betButton: com.example.service.UiTarget?,
+        fallbackBounds: RectBounds,
+        map: ScreenMap,
+        strategyName: String,
+        isManualTrigger: Boolean = true,
+        onResult: ((Boolean, String) -> Unit)? = null
+    ) {
+        if (map.phase != GamePhase.BETTING_OPEN) {
+            val reason = "Phase is ${map.phase.name}, betting not open"
+            _state.update { it.copy(statusLine = reason) }
+            onResult?.invoke(false, reason)
+            return
+        }
+        if (map.stakeField == null) {
+            val err = "Stake field not found — calibrated coordinate cannot bypass stake verification"
+            _state.update { it.copy(statusLine = err) }
+            repository.log(LogCategory.ERROR, err, "Coordinate tap blocked: missing stake input")
+            onResult?.invoke(false, err)
+            return
+        }
+
+        executeBetForMap(
+            map = map,
+            manualOverrideDecision = StrategyDecision(true, strategyName, "Calibrated target tap"),
+            isManualTrigger = isManualTrigger,
+            preferredBetBounds = betButton?.bounds ?: fallbackBounds,
+            onResult = onResult
+        )
+    }
+
+    private suspend fun markRuleTriggeredIfNeeded(
+        rules: List<com.example.data.model.StrategyRule>,
+        triggeredRuleName: String?,
+        nowMs: Long
+    ) {
+        if (triggeredRuleName.isNullOrBlank()) return
+        val matched = rules.firstOrNull {
+            it.enabled && it.cooldownSeconds > 0 && it.name == triggeredRuleName
+        } ?: return
+        repository.updateRule(matched.copy(lastTriggeredAtMs = nowMs))
+    }
+
+    private fun enrichBetWithScreenEvidence(bet: ActiveBetRecord?, map: ScreenMap): ActiveBetRecord? {
+        if (bet == null) return null
+        val updatedState = if (map.autoCashOutState != SwitchState.UNREADABLE) map.autoCashOutState else bet.autoCashOutStateAtBet
+        val updatedTarget = map.autoCashOutTarget ?: bet.autoCashOutTargetAtBet
+        val updatedCashMult = map.cashedOutMultiplier ?: bet.observedCashOutMultiplier
+        val updatedWinAmt = map.winBannerAmount ?: bet.observedWinAmount
+        val updatedBal = map.balance ?: bet.latestObservedBalance
+        val updatedAfterConfirm = bet.balanceAfterConfirm ?: if (map.cancelButton != null && map.balance != null) map.balance else null
+        return bet.copy(
+            autoCashOutStateAtBet = updatedState,
+            autoCashOutTargetAtBet = updatedTarget,
+            observedCashOutMultiplier = updatedCashMult,
+            observedWinAmount = updatedWinAmt,
+            latestObservedBalance = updatedBal,
+            balanceAfterConfirm = updatedAfterConfirm
+        )
+    }
+
+    private data class VerifiedSettlementOutcome(
+        val won: Boolean?,
+        val profitDelta: Double,
+        val effectiveTarget: Double,
+        val reason: String
+    )
+
+    private fun resolveVerifiedOutcome(
+        bet: ActiveBetRecord,
+        crashMult: Double,
+        latestMap: ScreenMap,
+        crashKnown: Boolean = true
+    ): VerifiedSettlementOutcome {
+        val enriched = enrichBetWithScreenEvidence(bet, latestMap)!!
+        val obsCashMult = enriched.observedCashOutMultiplier
+        val obsWinAmt = enriched.observedWinAmount
+        val autoState = enriched.autoCashOutStateAtBet
+        val autoTarget = enriched.autoCashOutTargetAtBet
+        val balBefore = enriched.balanceBeforeBet
+        val balAfterConfirm = enriched.balanceAfterConfirm
+        val balNow = enriched.latestObservedBalance
+
+        // FIX(martingale): a cash-out at X is impossible if the round crashed below X. Stale win banners or
+        // balance bumps from the previous round used to be counted as a win and reset the stake to base.
+        fun plausible(x: Double) = !crashKnown || crashMult + 0.02 >= x
+
+        if (obsCashMult != null && plausible(obsCashMult)) {
+            val profit = obsWinAmt?.let { it - bet.stake } ?: (bet.stake * (obsCashMult - 1.0))
+            return VerifiedSettlementOutcome(
+                won = true,
+                profitDelta = profit,
+                effectiveTarget = obsCashMult,
+                reason = "Verified cashout ${StakeCalculator.formatStake(obsCashMult)}x"
+            )
+        }
+        if (obsWinAmt != null && obsWinAmt > bet.stake && plausible((obsWinAmt / bet.stake).coerceAtLeast(1.01))) {
+            val profit = obsWinAmt - bet.stake
+            val effTarget = (obsWinAmt / bet.stake).coerceAtLeast(1.01)
+            return VerifiedSettlementOutcome(
+                won = true,
+                profitDelta = profit,
+                effectiveTarget = effTarget,
+                reason = "Verified win banner +${StakeCalculator.formatStake(profit)}"
+            )
+        }
+        if (autoState == SwitchState.ON && autoTarget != null &&
+            kotlin.math.abs(autoTarget - bet.targetMultiplier) <= 0.05
+        ) {
+            val won = crashMult >= autoTarget
+            val profit = if (won) bet.stake * (autoTarget - 1.0) else -bet.stake
+            return VerifiedSettlementOutcome(
+                won = won,
+                profitDelta = profit,
+                effectiveTarget = autoTarget,
+                reason = "Verified via built-in Auto Cash Out ${StakeCalculator.formatStake(autoTarget)}x"
+            )
+        }
+        if (balAfterConfirm != null && balNow != null && (balNow - balAfterConfirm) >= bet.stake * 1.01 &&
+            plausible(((balNow - balAfterConfirm) / bet.stake).coerceAtLeast(1.01))
+        ) {
+            val payout = balNow - balAfterConfirm
+            val profit = payout - bet.stake
+            val effTarget = (payout / bet.stake).coerceAtLeast(1.01)
+            return VerifiedSettlementOutcome(
+                won = true,
+                profitDelta = profit,
+                effectiveTarget = effTarget,
+                reason = "Verified balance payout +${StakeCalculator.formatStake(profit)}"
+            )
+        }
+        if (balBefore != null && balNow != null && (balNow - balBefore) > 0.05 &&
+            plausible(((bet.stake + (balNow - balBefore)) / bet.stake).coerceAtLeast(1.01))
+        ) {
+            val profit = balNow - balBefore
+            val effTarget = ((bet.stake + profit) / bet.stake).coerceAtLeast(1.01)
+            return VerifiedSettlementOutcome(
+                won = true,
+                profitDelta = profit,
+                effectiveTarget = effTarget,
+                reason = "Verified balance gain +${StakeCalculator.formatStake(profit)}"
+            )
+        }
+        if (balBefore != null && balNow != null &&
+            kotlin.math.abs((balBefore - bet.stake) - balNow) <= 0.05 &&
+            autoState == SwitchState.OFF
+        ) {
+            return VerifiedSettlementOutcome(
+                won = false,
+                profitDelta = -bet.stake,
+                effectiveTarget = bet.targetMultiplier,
+                reason = "Verified stake loss via balance"
+            )
+        }
+        if (crashKnown && crashMult <= 1.00) {
+            return VerifiedSettlementOutcome(
+                won = false,
+                profitDelta = -bet.stake,
+                effectiveTarget = bet.targetMultiplier,
+                reason = "Instant crash 1.00x"
+            )
+        }
+        return VerifiedSettlementOutcome(
+            won = null,
+            profitDelta = 0.0,
+            effectiveTarget = bet.targetMultiplier,
+            reason = "Outcome unverified (Auto Cash Out ${autoState.name}, no cashout proof)"
+        )
+    }
+
+    private suspend fun recordCurrentCrashAndSettle(
+        crashMult: Double,
+        siteUrl: String,
+        config: StrategyConfig,
+        latestMap: ScreenMap,
+        recordTimestampMs: Long = System.currentTimeMillis(),
+        settleBet: Boolean = true
+    ) {
+        roundCounter++
+        val roundId = "R-$roundCounter"
+        val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
+        val won = crashMult >= targetMult // game cashes out AT the target, so equal is a win
+        val currentStake = _state.value.currentStake
+        val prevLosses = _state.value.consecutiveLosses
+        val prevDeficit = _state.value.recoveryDeficit
+
+        val bet = if (settleBet) (activeBet ?: pendingSettlementBet) else null
+        val hasConfirmedBet = bet != null
+        val roundSig = bet?.roundSignature ?: "OBS-$roundCounter"
+
+        if (hasConfirmedBet) {
+            if (roundSig in settledBetSignatures) {
+                return
+            }
+            settledBetSignatures.add(roundSig)
+        }
+
+        val stakePlaced: Double? = bet?.stake // null for passive observation rounds (they are NOT bet results)
+        val outcome = if (hasConfirmedBet) {
+            resolveVerifiedOutcome(bet!!, crashMult, latestMap)
+        } else {
+            null
+        }
+        val actualWon = outcome?.won ?: won
+        val profitDelta = if (hasConfirmedBet) {
+            if (actualWon) {
+                val baseProfit = bet!!.stake * (targetMult - 1.0)
+                if (outcome?.profitDelta != null && outcome.profitDelta > 0.0) outcome.profitDelta else baseProfit
+            } else {
+                -bet!!.stake
+            }
+        } else {
+            0.0
+        }
+
+        repository.recordRound(
+            RoundRecord(
+                roundId = roundId,
+                timestampMs = recordTimestampMs,
+                crashMultiplier = crashMult,
+                stakePlaced = stakePlaced,
+                targetMultiplier = targetMult,
+                won = if (hasConfirmedBet) actualWon else null,
+                profitDelta = profitDelta,
+                strategyName = bet?.strategyName ?: "Live Observation",
+                siteName = siteUrl
+            )
+        )
+
+        if (hasConfirmedBet) {
+            val progression = applyOutcome(
+                bet = bet!!,
+                won = actualWon,
+                actualProfit = if (outcome?.profitDelta != null && outcome.profitDelta > 0) outcome.profitDelta else null,
+                targetMult = targetMult
+            )
+
+            val resultLine = if (actualWon) {
+                "Won (${StakeCalculator.formatStake(crashMult)}x > ${StakeCalculator.formatStake(targetMult)}x) -> Reset stake"
+            } else {
+                "Lost (${StakeCalculator.formatStake(crashMult)}x <= ${StakeCalculator.formatStake(targetMult)}x) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
+            }
+
+            repository.log(LogCategory.RESULT, resultLine, "Crash ${StakeCalculator.formatStake(crashMult)}x")
+
+            releaseBetLock()
+            pendingSettlementBet = null
+            pendingCreatedAtMs = 0L
+
+            _state.update {
+                it.copy(
+                    currentStake = progression.nextStake,
+                    consecutiveLosses = progression.consecutiveLosses,
+                    recoveryDeficit = progression.recoveryDeficit,
+                    latestCrashMultiplier = crashMult,
+                    monitoredCrashCount = crashTracker.monitoredCrashCount,
+                    recordedMultipliers = liveRecordedMultipliers.toList(),
+                    statusLine = resultLine,
+                    handState = FloatingHandState.WAITING,
+                    handStatusText = "Waiting"
+                )
+            }
+
+            if (progression.shouldStop) {
+                stop(progression.stopReason ?: "loss streak limit reached")
+            }
+        } else {
+            _state.update {
+                it.copy(
+                    latestCrashMultiplier = crashMult,
+                    monitoredCrashCount = crashTracker.monitoredCrashCount,
+                    recordedMultipliers = liveRecordedMultipliers.toList()
+                )
+            }
+        }
+    }
+
+    /**
+     * SINGLE WRITER for stake progression. Every win/loss goes through here: it reads the latest settings from the
+     * database (so the mode shown in Settings is the mode used), reads the current streak/deficit under the lock,
+     * applies StakeCalculator, then saves + publishes the result in one step.
+     */
+    private suspend fun applyOutcome(
+        bet: ActiveBetRecord,
+        won: Boolean,
+        actualProfit: Double?,
+        targetMult: Double
+    ): StakeProgressionResult = progressionLock.withLock {
+        val cfg = repository.getConfig()
+        val cur = _state.value
+        val result = if (won) {
+            StakeCalculator.onWin(
+                baseStake = cfg.baseStake,
+                previousStake = bet.stake,
+                previousConsecutiveLosses = cur.consecutiveLosses,
+                currentDeficit = cur.recoveryDeficit,
+                targetMultiplier = targetMult,
+                resetAfterWin = cfg.resetAfterWin,
+                actualProfit = actualProfit
+            )
+        } else {
+            StakeCalculator.onLoss(
+                previousStake = bet.stake,
+                baseStake = cfg.baseStake,
+                mode = cfg.afterLoss,
+                addAmount = cfg.addAmount,
+                previousConsecutiveLosses = cur.consecutiveLosses,
+                stopAfterLosses = cfg.stopAfterLosses,
+                currentDeficit = cur.recoveryDeficit
+            )
+        }
+        repository.saveSessionProgression(result.nextStake, result.consecutiveLosses, result.recoveryDeficit)
+        _state.update {
+            it.copy(
+                currentStake = result.nextStake,
+                consecutiveLosses = result.consecutiveLosses,
+                recoveryDeficit = result.recoveryDeficit,
+                afterLossMode = cfg.afterLoss
+            )
+        }
+        repository.log(
+            LogCategory.STAKE,
+            "PROGRESSION ${if (won) "WIN" else "LOSS"} mode=${cfg.afterLoss.name}",
+            "placed=${StakeCalculator.formatStake(bet.stake)} next=${StakeCalculator.formatStake(result.nextStake)} " +
+                "losses=${result.consecutiveLosses} deficit=${StakeCalculator.formatStake(result.recoveryDeficit)} " +
+                "add=${StakeCalculator.formatStake(cfg.addAmount)} stopAfter=${cfg.stopAfterLosses}"
+        )
+        result
+    }
+
+    /**
+     * FIX(martingale): settles a confirmed bet whose crash number was never read (rare scanning, banner missed).
+     * Uses the same verified-outcome rules. If the outcome is still unproven the stake is left untouched
+     * (never guess a win), but a proven loss now doubles / adds exactly like a normal loss.
+     */
+    private suspend fun settleWithoutCrashRead(bet: ActiveBetRecord, config: StrategyConfig, latestMap: ScreenMap) {
+        if (bet.roundSignature in settledBetSignatures) return
+        val outcome = resolveVerifiedOutcome(bet, 0.0, latestMap, crashKnown = false)
+        val won = outcome.won
+        if (won == null) {
+            repository.log(LogCategory.RESULT, "Bet outcome unproven, stake unchanged", outcome.reason)
+            return
+        }
+        settledBetSignatures.add(bet.roundSignature)
+        val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
+        val profit = if (won) {
+            if (outcome.profitDelta > 0.0) outcome.profitDelta else bet.stake * (targetMult - 1.0)
+        } else {
+            -bet.stake
+        }
+        roundCounter++
+        val crashForRecord = _state.value.latestCrashMultiplier ?: 1.0
+        repository.recordRound(
+            RoundRecord(
+                roundId = "R-$roundCounter",
+                timestampMs = System.currentTimeMillis(),
+                crashMultiplier = crashForRecord,
+                stakePlaced = bet.stake,
+                targetMultiplier = targetMult,
+                won = won,
+                profitDelta = profit,
+                strategyName = (bet.strategyName ?: "Bet") + " (crash not read)",
+                siteName = latestMap.siteUrl
+            )
+        )
+        val progression = applyOutcome(
+            bet = bet,
+            won = won,
+            actualProfit = if (outcome.profitDelta > 0.0) outcome.profitDelta else null,
+            targetMult = targetMult
+        )
+        val line = if (won) "Won (${outcome.reason})" else "Lost (${outcome.reason}) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
+        repository.log(LogCategory.RESULT, line, "Crash number was not read; settled from screen evidence")
+        _state.update {
+            it.copy(
+                currentStake = progression.nextStake,
+                consecutiveLosses = progression.consecutiveLosses,
+                recoveryDeficit = progression.recoveryDeficit,
+                statusLine = line
+            )
+        }
+        if (progression.shouldStop) {
+            stop(progression.stopReason ?: "loss streak limit reached")
+        }
+    }
+
+    private fun buildStatusLine(
+        map: ScreenMap,
+        decision: StrategyDecision,
+        crashUpdate: CrashMonitorUpdate
+    ): String {
+        val active = activeBet
+        return when {
+            !map.gameWindowFound -> "Looking at the game..."
+            active != null && map.phase == GamePhase.IN_FLIGHT ->
+                "Round running (${map.liveMultiplier?.let { "${it}x" } ?: "in flight"})"
+            active != null ->
+                "Bet placed ${StakeCalculator.formatStake(active.stake)}"
+            map.phase == GamePhase.IN_FLIGHT ->
+                "Round running (${map.liveMultiplier?.let { "${it}x" } ?: "in flight"})"
+            crashUpdate.newCrashMultipliers.isNotEmpty() ->
+                "Crashed at ${StakeCalculator.formatStake(crashUpdate.newCrashMultipliers.last())}x"
+            !decision.shouldBet -> decision.reason
+            else -> "Ready to bet ${StakeCalculator.formatStake(_state.value.currentStake)}"
+        }
+    }
+
+    private fun computeRoundKey(map: ScreenMap): String =
+        "${map.packageName}_${roundCounter}_${crashTracker.latestCrashMultiplier ?: map.lastCrashMultiplier ?: 0.0}_${map.ribbonMultipliers.firstOrNull() ?: 0.0}"
+}

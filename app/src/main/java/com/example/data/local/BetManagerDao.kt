@@ -58,16 +58,16 @@ interface BetManagerDao {
     @Query("SELECT * FROM round_records ORDER BY timestampMs DESC, id DESC LIMIT 200")
     fun observeRecentRounds(): Flow<List<RoundRecord>>
 
-    @Query("SELECT * FROM round_records WHERE stakePlaced IS NOT NULL ORDER BY timestampMs DESC, id DESC LIMIT 5")
+    @Query("SELECT * FROM round_records WHERE stakePlaced IS NOT NULL AND stakePlaced > 0 ORDER BY timestampMs DESC, id DESC LIMIT 5")
     fun observeLastFiveBetResults(): Flow<List<RoundRecord>>
 
     @Query("SELECT * FROM round_records ORDER BY timestampMs DESC, id DESC LIMIT 50")
     suspend fun getRecentRoundsOnce(): List<RoundRecord>
 
-    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
+    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND stakePlaced > 0 AND won IS NOT NULL")
     fun observeTodayProfit(dayStartMs: Long): Flow<Double>
 
-    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
+    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND stakePlaced > 0 AND won IS NOT NULL")
     suspend fun getTodayProfitOnce(dayStartMs: Long): Double
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -84,6 +84,22 @@ interface BetManagerDao {
 
     @Query("DELETE FROM diagnostic_logs")
     suspend fun clearLogs()
+
+    // ---- session wipe (app closed / exited / fresh launch) ----
+    @Query("DELETE FROM round_records")
+    suspend fun clearRounds()
+
+    @Query("DELETE FROM crash_records")
+    suspend fun clearCrashRecords()
+
+    @Query("DELETE FROM multiplier_records")
+    suspend fun clearMultiplierRecords()
+
+    @Query("DELETE FROM pattern_occurrences")
+    suspend fun clearPatternOccurrences()
+
+    @Query("DELETE FROM notification_history")
+    suspend fun clearNotificationHistory()
 
     // --- 4-Strategy Custom Pattern Architecture ---
 

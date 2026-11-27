@@ -1,0 +1,13 @@
+Install (remove .txt), all under app/src/main/java/com/example/ :
+AutomationEngine.kt                  -> data/engine/   (includes the martingale fixes from the previous delivery)
+BetManagerDao.kt                     -> data/local/    (includes the previous delivery's query fix)
+BetManagerRepository.kt              -> data/local/
+ScreenEarnerAccessibilityService.kt  -> service/
+MainActivity.kt                      -> (root, next to the other files)
+
+Manual test (not compiled or run by me):
+1. Start the bot, let a few rounds record, press EXIT -> overlay disappears, notifications gone, alarm silent.
+2. Open the app again -> Home shows empty history, stake = base stake, no crashes tracked, overlay returns.
+3. Start, then swipe the app away in Recents -> overlay disappears; reopen -> empty history again.
+4. Home button (not closing) -> bot and overlay KEEP running.
+5. Rotate the phone -> nothing is wiped.

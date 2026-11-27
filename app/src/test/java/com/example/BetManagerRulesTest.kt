@@ -1045,6 +1045,7 @@ class BetManagerRulesTest {
         val context = ApplicationProvider.getApplicationContext<android.app.Application>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
+            .fallbackToDestructiveMigration(true)
             .build()
         try {
             val repo = BetManagerRepository(context, db.betManagerDao())
