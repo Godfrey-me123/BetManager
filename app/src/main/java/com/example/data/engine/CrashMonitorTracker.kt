@@ -67,6 +67,11 @@ class CrashMonitorTracker {
         }
 
         val currentRibbon = map.ribbonMultipliers.filter { it.isFinite() && it >= 1.0 }
+        val bannerCrash = map.lastCrashMultiplier?.takeIf { it.isFinite() && it >= 1.0 }
+        val immediateLatest = bannerCrash ?: currentRibbon.firstOrNull()
+        if (immediateLatest != null) {
+            latestCrashMultiplier = immediateLatest
+        }
         val newlyRecorded = mutableListOf<Double>()
         var summary = "Watching live rounds"
 
@@ -115,14 +120,18 @@ class CrashMonitorTracker {
                         }
                         if (newlyRecorded.isNotEmpty()) {
                             summary = "Recorded ${newlyRecorded.size} crash(es), latest ${formatMult(newlyRecorded.last())}x"
+                            if (map.phase == GamePhase.CRASHED && bannerCrash != null && approxEq(bannerCrash, newlyRecorded.last())) {
+                                pendingCrashFromBanner = bannerCrash
+                                lastBannerCrashRecordedAtMs = nowMs
+                            }
                         }
+                        latestCrashMultiplier = currentRibbon.first()
                     }
                 }
             }
         }
 
         // 2. Detect live CRASHED banner / IN_FLIGHT -> BETTING_OPEN transition immediately
-        val bannerCrash = map.lastCrashMultiplier?.takeIf { it.isFinite() && it >= 1.0 }
 
         if (!initialBannerObserved) {
             initialBannerObserved = true
@@ -184,7 +193,11 @@ class CrashMonitorTracker {
 
         // Pure tail expansion/truncation when prefix matches (e.g. expanded history drawer or clipped rightmost badge)
         val minLen = min(previous.size, current.size)
-        if (minLen >= 2 && (0 until minLen).all { approxEq(previous[it], current[it]) }) {
+        val allSameHead = previous.isNotEmpty() &&
+            current.size == previous.size + 1 &&
+            previous.all { approxEq(it, current.first()) } &&
+            approxEq(current.last(), current.first())
+        if (!allSameHead && minLen >= 2 && (0 until minLen).all { approxEq(previous[it], current[it]) }) {
             return RibbonAlignment.TailExtendedOrScroll("History tail changed without new crash")
         }
 

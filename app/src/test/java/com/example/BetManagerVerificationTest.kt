@@ -284,6 +284,8 @@ class BetManagerVerificationTest {
             runCurrent()
             assertEquals(80.0, engine.state.value.currentStake, 0.01)
             assertEquals(140.0, engine.state.value.recoveryDeficit, 0.01)
+            engine.stopForExit()
+            runCurrent()
         } finally {
             db.close()
         }
@@ -350,7 +352,7 @@ class BetManagerVerificationTest {
     }
 
     @Test
-    fun `unverified cashout outcome records unknown won=null without recovery progression, and duplicate crash does not double settle`() = runTest {
+    fun `strict binary outcome settles 3_50x above 2_00x as win and duplicate crash does not double settle`() = runTest {
         val context = ApplicationProvider.getApplicationContext<Application>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
@@ -402,26 +404,134 @@ class BetManagerVerificationTest {
             runCurrent()
             assertTrue(engine.hasActiveBetLock())
 
-            // Crash 3.50x arrives WITHOUT Auto Cash Out verification or cashout banner -> outcome MUST be unknown (won = null)
-            engine.handleScreenEvent(
-                ScreenMap(
-                    timestampMs = 8000L,
-                    packageName = "com.android.chrome",
-                    phase = GamePhase.CRASHED,
-                    lastCrashMultiplier = 3.50,
-                    ribbonMultipliers = listOf(3.50, 1.50, 2.10),
-                    autoCashOutState = SwitchState.UNREADABLE
-                )
+            // Crash 3.50x (> 2.00x target) -> strict binary WIN even if Auto Cash Out UI is unreadable
+            val crashMap = ScreenMap(
+                timestampMs = 8000L,
+                packageName = "com.android.chrome",
+                phase = GamePhase.CRASHED,
+                lastCrashMultiplier = 3.50,
+                ribbonMultipliers = listOf(3.50, 1.50, 2.10),
+                autoCashOutState = SwitchState.UNREADABLE
             )
+            engine.handleScreenEvent(crashMap)
             runCurrent()
 
-            val round = repo.getRecentRounds().firstOrNull { it.stakePlaced != null }
-            assertNotNull(round)
-            assertNull("Unverified outcome must record won = null", round?.won)
-            assertEquals(0.0, round?.profitDelta ?: -1.0, 0.001)
-            assertEquals(0.0, repo.getTodayProfit(), 0.001)
+            // Duplicate CRASHED snapshot of the exact same 3.50x must NOT double-settle
+            engine.handleScreenEvent(crashMap.copy(timestampMs = 8500L))
+            runCurrent()
+
+            val settledRounds = repo.getRecentRounds().filter { it.stakePlaced != null }
+            assertEquals(1, settledRounds.size)
+            val round = settledRounds.first()
+            assertEquals(true, round.won)
+            assertEquals(20.0, round.profitDelta, 0.001)
+            assertEquals(20.0, repo.getTodayProfit(), 0.001)
             assertEquals(20.0, engine.state.value.currentStake, 0.01)
             assertEquals(0, engine.state.value.consecutiveLosses)
+
+            engine.stopForExit()
+            runCurrent()
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `history ribbon index 0 never skips leftmost chip and flewAway does not grab previous chip`() {
+        val nodes = listOf(
+            // Y centers 182 vs 178 straddle 45*4=180; leftmost chip 1.22x must stay index 0
+            ScannedNode("c0", UiTarget("c0", RectBounds(20, 160, 110, 204), text = "1.22x"), treeOrder = 1),
+            ScannedNode("c1", UiTarget("c1", RectBounds(120, 156, 210, 200), text = "1.11x"), treeOrder = 2),
+            ScannedNode("c2", UiTarget("c2", RectBounds(220, 158, 310, 202), text = "1.68x"), treeOrder = 3),
+            ScannedNode("bet", UiTarget("bet", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true), treeOrder = 4)
+        )
+        val openMap = AccessibilityController.scanNodes("com.android.chrome", nodes)
+        assertEquals(listOf(1.22, 1.11, 1.68), openMap.ribbonMultipliers)
+
+        // When FLEW AWAY! appears without center multiplier text, lastCrashMultiplier must stay null rather than grabbing 1.11x
+        val flewAwayNodes = listOf(
+            ScannedNode("banner", UiTarget("banner", RectBounds(250, 400, 800, 480), text = "FLEW AWAY!"), treeOrder = 0),
+            ScannedNode("c1", UiTarget("c1", RectBounds(20, 160, 110, 204), text = "1.11x"), treeOrder = 1),
+            ScannedNode("c2", UiTarget("c2", RectBounds(120, 156, 210, 200), text = "1.68x"), treeOrder = 2),
+            ScannedNode("bet", UiTarget("bet", RectBounds(520, 1100, 980, 1240), text = "Bet 20.00 TZS", isClickable = true), treeOrder = 3)
+        )
+        val crashMap = AccessibilityController.scanNodes("com.android.chrome", flewAwayNodes)
+        assertEquals(GamePhase.CRASHED, crashMap.phase)
+        assertNull("flewAway without center text must not fall back to previous ribbon chip", crashMap.lastCrashMultiplier)
+    }
+
+    @Test
+    fun `waiting between bets updates crash index 0, Last history L L, doubles stake, stops at max losses, and resets strictly above target`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        try {
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            repo.ensureInitialized()
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 20.0,
+                    cashOutTarget = 2.0,
+                    afterLoss = AfterLossMode.DOUBLE,
+                    stopAfterLosses = 3,
+                    bettingMode = BettingMode.USE_STRATEGY_RULES
+                )
+            )
+            val platform = FakeVerificationPlatform(clockMs = { testScheduler.currentTime })
+            val engine = AutomationEngine(repo, CoroutineScope(SupervisorJob() + dispatcher))
+            engine.attachAccessibility(AutoTouchDriver(platform), ScanScheduler(platform, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime }))
+            engine.start()
+            runCurrent()
+
+            // Baseline [1.68, 2.50]
+            engine.handleScreenEvent(ScreenMap(timestampMs = 1000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.68, 2.50)))
+            runCurrent()
+            assertEquals(1.68, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
+
+            // New crash 1.22x (<= 2.00 -> LOSS #1): Crash=1.22, pill[0]=1.22, Last=L, Stake=40.0
+            engine.handleScreenEvent(ScreenMap(timestampMs = 5000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.22, 1.68, 2.50)))
+            runCurrent()
+            assertEquals(1.22, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
+            assertEquals(1.22, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
+            assertEquals(40.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+
+            // New crash 1.11x (<= 2.00 -> LOSS #2): Crash=1.11, pill[0]=1.11, Last=L L, Stake=80.0
+            engine.handleScreenEvent(ScreenMap(timestampMs = 9000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.11, 1.22, 1.68, 2.50)))
+            runCurrent()
+            assertEquals(1.11, engine.state.value.latestCrashMultiplier ?: 0.0, 0.001)
+            assertEquals(1.11, engine.state.value.recordedMultipliers.firstOrNull() ?: 0.0, 0.001)
+            assertEquals(80.0, engine.state.value.currentStake, 0.01)
+            assertEquals(2, engine.state.value.consecutiveLosses)
+            val lastFive = repo.lastFiveBetResultsFlow.first()
+            assertEquals(listOf(false, false), lastFive.mapNotNull { it.won })
+
+            // Crash exactly 2.00x (<= 2.00 -> LOSS #3): hits stopAfterLosses=3 and stops immediately
+            engine.handleScreenEvent(ScreenMap(timestampMs = 13_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68)))
+            runCurrent()
+            assertFalse("Engine must stop immediately when consecutive losses reach limit", engine.state.value.isRunning)
+            assertEquals(20.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+            assertTrue(engine.state.value.statusLine.startsWith("Stopped:"))
+
+            // Restart and test > 2.00x WIN resets doubled stake to 20.0 and 0 losses
+            engine.start()
+            runCurrent()
+            engine.handleScreenEvent(ScreenMap(timestampMs = 15_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.00, 1.11, 1.22, 1.68)))
+            engine.handleScreenEvent(ScreenMap(timestampMs = 19_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(1.30, 2.00, 1.11, 1.22)))
+            runCurrent()
+            assertEquals(40.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+
+            engine.handleScreenEvent(ScreenMap(timestampMs = 23_000L, packageName = "com.android.chrome", phase = GamePhase.BETTING_OPEN, ribbonMultipliers = listOf(2.01, 1.30, 2.00, 1.11)))
+            runCurrent()
+            assertEquals(20.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+
+            engine.stopForExit()
+            runCurrent()
         } finally {
             db.close()
         }
@@ -642,5 +752,86 @@ class BetManagerVerificationTest {
         assertEquals(StakeProgressionMode.ADD_AMOUNT, afterVmSave.lossProgressionMode)
         assertEquals(15.0, afterVmSave.addAmount, 0.01)
         assertEquals(15.0, afterVmSave.lossProgressionAddAmount, 0.01)
+    }
+
+    @Test
+    fun `doubled stake sets numeric field correctly even when scrolled 660px upward by IME`() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val preScrollBounds = RectBounds(140, 1220, 380, 1300)
+        val scrolledImeBounds = RectBounds(140, 560, 380, 640)
+        var currentText = "20.00"
+        var focusedBounds = preScrollBounds
+
+        val platform = object : DriverPlatform {
+            override val ownPackageName: String = "com.aistudio.betmanager.rtxpvw"
+            override val preferRealTouchGesture: Boolean = false
+            override fun currentTimeMs(): Long = testScheduler.currentTime
+            override fun scanScreen(): ScreenMap = scanScreenWithPanel(null)
+            override fun scanScreenWithPanel(preferredBetPanelBounds: RectBounds?): ScreenMap {
+                return ScreenMap(
+                    timestampMs = currentTimeMs(),
+                    packageName = "com.android.chrome",
+                    phase = GamePhase.BETTING_OPEN,
+                    stakeField = UiTarget("stake_node", focusedBounds, text = currentText, isEditable = true, isClickable = true),
+                    hasImeWindow = true
+                )
+            }
+            override fun findNode(query: String, editableOnly: Boolean): UiTarget? = null
+            override fun findFocusedInput(): UiTarget? = UiTarget("stake_node", scrolledImeBounds, text = currentText, isEditable = true, isFocused = true)
+            override fun hasImeWindow(): Boolean = true
+            override fun performNodeClick(nodeId: String): Boolean {
+                focusedBounds = scrolledImeBounds
+                return true
+            }
+            override fun performFocus(nodeId: String): Boolean {
+                focusedBounds = scrolledImeBounds
+                return true
+            }
+            override fun performSetText(nodeId: String, text: String): Boolean {
+                currentText = text
+                return true
+            }
+            override suspend fun dispatchTapGesture(x: Float, y: Float, durationMs: Long): Boolean = true
+            override fun performGlobalBack(): Boolean = true
+        }
+
+        val driver = AutoTouchDriver(platform)
+        val initialTarget = UiTarget("stake_node", preScrollBounds, text = "20.00", isEditable = true, isClickable = true)
+        val res = driver.setVerifiedNumericField(
+            fieldBounds = preScrollBounds,
+            initialTarget = initialTarget,
+            expectedValue = 40.00,
+            formattedText = "40.00",
+            tolerance = 0.05
+        )
+        assertTrue(res.success)
+        assertEquals(40.00, res.readBackValue ?: 0.0, 0.01)
+    }
+
+    @Test
+    fun `identical consecutive head multiplier is recorded immediately at index 0`() {
+        val tracker = CrashMonitorTracker()
+        val baseline = tracker.onScreenSnapshot(
+            ScreenMap(
+                timestampMs = 1000L,
+                packageName = "com.android.chrome",
+                phase = GamePhase.BETTING_OPEN,
+                ribbonMultipliers = listOf(1.68, 1.68)
+            )
+        )
+        assertTrue(baseline.newCrashMultipliers.isEmpty())
+        assertEquals(1.68, baseline.latestCrashMultiplier ?: 0.0, 0.001)
+
+        val next = tracker.onScreenSnapshot(
+            ScreenMap(
+                timestampMs = 5000L,
+                packageName = "com.android.chrome",
+                phase = GamePhase.BETTING_OPEN,
+                ribbonMultipliers = listOf(1.68, 1.68, 1.68)
+            )
+        )
+        assertEquals(listOf(1.68), next.newCrashMultipliers)
+        assertEquals(1, next.monitoredCrashCount)
+        assertEquals(1.68, next.latestCrashMultiplier ?: 0.0, 0.001)
     }
 }

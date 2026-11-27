@@ -16,6 +16,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
@@ -68,6 +69,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var stateObserverJob: Job? = null
+    private var trailingContentScanJob: Job? = null
 
     private lateinit var repository: BetManagerRepository
     private lateinit var engine: AutomationEngine
@@ -234,7 +236,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
                 .collectLatest { (d, p) ->
                     val ui = d.ui
                     if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
-                    val stake = if (ui.isRunning || ui.consecutiveLosses > 0 || ui.recoveryDeficit > 0.01) ui.currentStake else d.config.baseStake
+                    val stake = ui.currentStake
                     overlayManager?.update(
                         OverlayInfo(
                             isRunning = ui.isRunning,
@@ -242,6 +244,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
                             gameLine = "${ui.gameName} · ${ui.siteUrl}",
                             balanceText = ui.balance?.let { "%.2f %s".format(it, ui.currency) } ?: "--",
                             stakeText = "%.2f %s".format(stake, ui.currency),
+                            baseStakeText = "%.2f %s".format(d.config.baseStake, ui.currency),
                             lossStreak = ui.consecutiveLosses,
                             phaseText = ui.phase.name.lowercase().replace('_', ' '),
                             multiplierText = ui.liveMultiplier?.let { "%.2fx".format(it) } ?: "",
@@ -349,10 +352,24 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
             val scan = scheduler.onContentChangedThrottled(
                 packageName = pkg,
                 preferredBetPanelBounds = targetBounds,
-                minIntervalMs = 900L
+                minIntervalMs = 350L
             )
             if (scan != null) {
+                trailingContentScanJob?.cancel()
                 engine.handleScreenEvent(scan)
+            } else if (trailingContentScanJob?.isActive != true) {
+                trailingContentScanJob = serviceScope.launch {
+                    delay(240L)
+                    val trailingTarget = if (::engine.isInitialized) engine.activeTargetBounds() else targetBounds
+                    val followUp = scheduler.onContentChangedThrottled(
+                        packageName = pkg,
+                        preferredBetPanelBounds = trailingTarget,
+                        minIntervalMs = 220L
+                    )
+                    if (followUp != null) {
+                        engine.handleScreenEvent(followUp)
+                    }
+                }
             }
         }
     }
@@ -398,6 +415,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
 
     private fun cleanup() {
         stateObserverJob?.cancel()
+        trailingContentScanJob?.cancel()
         overlayManager?.hide()
         if (::engine.isInitialized) {
             engine.detachAccessibility()

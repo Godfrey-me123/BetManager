@@ -429,6 +429,7 @@ class CustomStrategyIntegrationTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
             .allowMainThreadQueries()
+            .fallbackToDestructiveMigration()
             .build()
         val dispatcher = StandardTestDispatcher(testScheduler)
         val engineScope = CoroutineScope(SupervisorJob() + dispatcher)

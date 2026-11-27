@@ -34,6 +34,7 @@ data class OverlayInfo(
     val gameLine: String = "",
     val balanceText: String = "--",
     val stakeText: String = "--",
+    val baseStakeText: String = "",
     val lossStreak: Int = 0,
     val phaseText: String = "",
     val multiplierText: String = "",
@@ -228,14 +229,21 @@ class FloatingHandsOverlayManager(
     }
 
     fun update(info: OverlayInfo) {
-        val startedNow = info.isRunning && !wasRunning
-        wasRunning = info.isRunning
-        lastInfo = info
-        if (expanded && startedNow && activeTab == OverlayTab.LIVE && !info.isAlarmActive) {
-            setExpanded(false)
-            return
+        val applyUpdate = Runnable {
+            val startedNow = info.isRunning && !wasRunning
+            wasRunning = info.isRunning
+            lastInfo = info
+            if (expanded && startedNow && activeTab == OverlayTab.LIVE && !info.isAlarmActive) {
+                setExpanded(false)
+                return@Runnable
+            }
+            applyInfo(info)
         }
-        applyInfo(info)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyUpdate.run()
+        } else {
+            mainHandler.post(applyUpdate)
+        }
     }
 
     private fun applyPassThroughToView(
@@ -809,12 +817,13 @@ class FloatingHandsOverlayManager(
                 setStroke(dp(3), stroke)
             }
             setTextColor(textCol)
+            val shortStake = shortStakeAmount(info.stakeText)
             text = when (info.handState) {
-                FloatingHandState.LOCKED -> "BET\nLOCK"
-                FloatingHandState.READY -> if (info.handAutoBetEnabled) "BET\nAUTO" else "BET\nTAP"
+                FloatingHandState.LOCKED -> if (shortStake.isNotBlank()) "LOCK\n$shortStake" else "BET\nLOCK"
+                FloatingHandState.READY -> if (shortStake.isNotBlank()) "BET\n$shortStake" else if (info.handAutoBetEnabled) "BET\nAUTO" else "BET\nTAP"
                 FloatingHandState.WAITING -> when {
-                    info.handAutoBetEnabled && info.betTargetDetected -> "AUTO\nWAIT"
-                    info.betTargetDetected -> "BET\nWAIT"
+                    info.handAutoBetEnabled && info.betTargetDetected -> if (shortStake.isNotBlank()) "AUTO\n$shortStake" else "AUTO\nWAIT"
+                    info.betTargetDetected -> if (shortStake.isNotBlank()) "WAIT\n$shortStake" else "BET\nWAIT"
                     else -> "BET\nDRAG"
                 }
             }
@@ -875,17 +884,18 @@ class FloatingHandsOverlayManager(
         crashText?.text = "Crash ${info.latestCrashText}   Tracked: ${info.monitoredCrashes}"
         balanceText?.text = "Balance ${info.balanceText}" +
             if (info.todayProfitText.isNotBlank()) "   Today ${info.todayProfitText}" else ""
-        stakeText?.text = "Stake ${info.stakeText} · $lossModeLabel · Win>=${"%.2fx".format(info.cashOutTarget)}" +
+        stakeText?.text = "Stake ${info.stakeText} · $lossModeLabel · Win>${"%.2fx".format(info.cashOutTarget)}" +
             if (info.lossStreak > 0) " (${info.lossStreak}L)" else ""
         liveText?.text = listOf(info.phaseText, info.multiplierText).filter { it.isNotBlank() }.joinToString("   ")
         resultsText?.text = if (info.lastResults.isEmpty()) "No bets yet"
         else "Last: " + info.lastResults.joinToString(" ") { if (it) "W" else "L" }
 
         betButton?.apply {
+            val stakeLabel = info.stakeText.takeIf { it.isNotBlank() && it != "--" }
             text = when (info.handState) {
-                FloatingHandState.READY -> "BET"
-                FloatingHandState.LOCKED -> "Bet placed"
-                FloatingHandState.WAITING -> "BET (Wait)"
+                FloatingHandState.READY -> if (stakeLabel != null) "BET $stakeLabel" else "BET"
+                FloatingHandState.LOCKED -> if (stakeLabel != null) "Bet placed $stakeLabel" else "Bet placed"
+                FloatingHandState.WAITING -> if (stakeLabel != null) "BET $stakeLabel (Wait)" else "BET (Wait)"
             }
             alpha = if (info.handState != FloatingHandState.LOCKED) 1f else 0.5f
             isEnabled = info.handState != FloatingHandState.LOCKED
@@ -983,7 +993,12 @@ class FloatingHandsOverlayManager(
         stylePillButton(lossDoubleBtn, info.afterLossMode == AfterLossMode.DOUBLE)
         stylePillButton(lossAddBtn, info.afterLossMode == AfterLossMode.ADD)
         stylePillButton(lossKeepBtn, info.afterLossMode == AfterLossMode.KEEP)
-        settingsStakeSummary?.text = "${info.stakeText} · Win >= ${"%.2fx".format(info.cashOutTarget)}"
+        val baseLabel = info.baseStakeText.ifBlank { info.stakeText }
+        settingsStakeSummary?.text = if (info.lossStreak > 0 && info.stakeText.isNotBlank() && info.stakeText != "--") {
+            "$baseLabel -> Next ${info.stakeText}"
+        } else {
+            "$baseLabel · Win>${"%.2fx".format(info.cashOutTarget)}"
+        }
 
         alarmHighSignalBtn?.apply {
             text = if (info.alarmHighSignalEnabled) "Alarm: ON" else "Alarm: OFF"
@@ -1001,6 +1016,12 @@ class FloatingHandsOverlayManager(
             text = if (info.alertVibrationEnabled) "Vibrate: ON" else "Vibrate: OFF"
             stylePillButton(this, info.alertVibrationEnabled)
         }
+    }
+
+    private fun shortStakeAmount(stakeText: String): String {
+        val raw = stakeText.trim().substringBefore(' ')
+        if (raw.isBlank() || raw == "--") return ""
+        return if (raw.endsWith(".00")) raw.removeSuffix(".00") else raw
     }
 
     private companion object {

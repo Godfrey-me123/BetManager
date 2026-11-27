@@ -695,11 +695,12 @@ object AccessibilityController {
             // Skip multipliers below the betting controls (e.g., player bet table)
             if (node.target.bounds.centerY >= stageFloorY) continue
 
-            val exactOrCompact = txt.length <= 14
-            val match = if (exactOrCompact) DECIMAL_MULTIPLIER_REGEX.find(txt) else null
+            val cleanTxt = txt.replace(",", "")
+            val exactOrCompact = cleanTxt.length <= 16
+            val match = if (exactOrCompact) DECIMAL_MULTIPLIER_REGEX.find(cleanTxt) else null
             val parsedVal = match?.groupValues?.getOrNull(1)?.toDoubleOrNull()
                 ?: if (viewId.contains("multiplier") || viewId.contains("history")) {
-                    ANY_MULTIPLIER_REGEX.find(txt)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
+                    ANY_MULTIPLIER_REGEX.find(cleanTxt)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
                 } else {
                     null
                 }
@@ -723,7 +724,7 @@ object AccessibilityController {
             if (!anchor.isHistoryHinted && anchorCy > ribbonMaxY) continue
             val rowMatches = multCandidates.filter { other ->
                 abs(other.bounds.centerY - anchorCy) <= 45f &&
-                    other.bounds.height <= 110 &&
+                    other.bounds.height <= 140 &&
                     (other.isHistoryHinted || other.bounds.centerY <= ribbonMaxY)
             }
             if (rowMatches.size >= 2 || anchor.isHistoryHinted) {
@@ -732,9 +733,37 @@ object AccessibilityController {
             }
         }
 
-        val ribbonSorted = multCandidates
+        // Cluster horizontal rows by <=45px Y tolerance (never integer-division buckets) and sort strictly left-to-right
+        val rawRibbonNodes = multCandidates
             .filter { it.orderIndex in horizontalRibbonNodes }
-            .sortedWith(compareBy<MultNodeCandidate>({ (it.bounds.centerY / 45f).toInt() }, { it.bounds.left }, { it.orderIndex }))
+            .sortedBy { it.bounds.centerY }
+        val clusteredRows = mutableListOf<MutableList<MultNodeCandidate>>()
+        for (cand in rawRibbonNodes) {
+            val matchingRow = clusteredRows.firstOrNull { row ->
+                abs(row.first().bounds.centerY - cand.bounds.centerY) <= 45f
+            }
+            if (matchingRow != null) {
+                matchingRow += cand
+            } else {
+                clusteredRows += mutableListOf(cand)
+            }
+        }
+        val ribbonSorted = clusteredRows.flatMap { row ->
+            val sortedRow = row.sortedWith(compareBy<MultNodeCandidate>({ it.bounds.left }, { it.orderIndex }))
+            val dedupedRow = mutableListOf<MultNodeCandidate>()
+            for (cand in sortedRow) {
+                val isDuplicateNode = dedupedRow.any { prev ->
+                    abs(prev.value - cand.value) < 0.001 &&
+                        (prev.bounds.overlaps(cand.bounds) ||
+                            (abs(prev.bounds.centerX - cand.bounds.centerX) <= 18f &&
+                                abs(prev.bounds.centerY - cand.bounds.centerY) <= 18f))
+                }
+                if (!isDuplicateNode) {
+                    dedupedRow += cand
+                }
+            }
+            dedupedRow
+        }
 
         val ribbonMultipliers = ribbonSorted.map { it.value }
         val ribbonBottomY = ribbonSorted.maxOfOrNull { it.bounds.bottom } ?: Int.MIN_VALUE
@@ -753,7 +782,7 @@ object AccessibilityController {
                 .filter { ribbonBottomY == Int.MIN_VALUE || it.bounds.centerY > ribbonBottomY }
             lastCrash = centerPool.maxWithOrNull(
                 compareBy<MultNodeCandidate>({ it.bounds.height }, { it.bounds.area })
-            )?.value ?: ribbonMultipliers.firstOrNull()
+            )?.value
         }
 
         val phase = when {

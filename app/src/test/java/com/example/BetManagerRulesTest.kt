@@ -1079,6 +1079,8 @@ class BetManagerRulesTest {
             assertFalse(alertManager.isAlarmActiveFlow.value)
             assertFalse(engine.state.value.isAlarmActive)
             assertNull(engine.state.value.activeAlarmTitle)
+            engine.stopForExit()
+            runCurrent()
         } finally {
             db.close()
         }

@@ -203,7 +203,8 @@ fun BetManagerRoot(
                             report = statisticalReport,
                             agentExplanation = agentExplanation,
                             selectedGameId = selectedPatternGameId,
-                            onSelectGameId = viewModel::selectPatternGameId
+                            onSelectGameId = viewModel::selectPatternGameId,
+                            engineState = engineState
                         )
                     }
                     composable(BetManagerTab.SETTINGS.route) {

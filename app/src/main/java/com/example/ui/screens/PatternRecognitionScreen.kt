@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -34,8 +36,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.engine.EngineUiState
 import com.example.data.engine.GameAdapterRegistry
 import com.example.data.engine.SmartAgentExplanation
+import com.example.data.engine.StakeCalculator
 import com.example.data.engine.StatisticalReport
 import com.example.data.model.CalendarHourUtils
 import com.example.ui.theme.ActionStartEmerald
@@ -48,7 +52,8 @@ fun PatternRecognitionScreen(
     report: StatisticalReport,
     agentExplanation: SmartAgentExplanation,
     selectedGameId: String,
-    onSelectGameId: (String) -> Unit
+    onSelectGameId: (String) -> Unit,
+    engineState: EngineUiState = EngineUiState()
 ) {
     val scrollState = rememberScrollState()
 
@@ -84,6 +89,80 @@ fun PatternRecognitionScreen(
                     onClick = { onSelectGameId(adapter.gameId) },
                     label = { Text(adapter.displayedGameName, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
                 )
+            }
+        }
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("live_crash_monitor_card"),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+        ) {
+            Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val immediateLatest = engineState.recordedMultipliers.firstOrNull()
+                    ?: engineState.latestCrashMultiplier
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "LIVE CRASH MONITOR (INDEX 0)",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp,
+                        color = PrimaryCobalt
+                    )
+                    Text(
+                        text = "Tracked: ${engineState.monitoredCrashCount} · Stake ${StakeCalculator.formatStake(engineState.currentStake)} ${engineState.currency}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Text(
+                    text = "Latest Crash: ${immediateLatest?.let { "${StakeCalculator.formatStake(it)}x" } ?: "--"}" +
+                        (engineState.liveMultiplier?.let { " · Live ${StakeCalculator.formatStake(it)}x" } ?: ""),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 15.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.testTag("patterns_latest_crash_text")
+                )
+                if (engineState.recordedMultipliers.isEmpty()) {
+                    Text(
+                        text = if (engineState.isRunning) {
+                            "Baseline active — waiting for next completed round..."
+                        } else {
+                            "Start monitor to stream live crashes."
+                        },
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    LazyRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("patterns_live_multipliers_row"),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(engineState.recordedMultipliers.take(12)) { mult ->
+                            Surface(
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f))
+                            ) {
+                                Text(
+                                    text = "${StakeCalculator.formatStake(mult)}x",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp,
+                                    color = PrimaryCobalt,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 

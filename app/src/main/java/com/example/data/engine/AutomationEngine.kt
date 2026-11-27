@@ -409,9 +409,13 @@ class AutomationEngine(
         startJob = scope.launch {
             initJob?.join()
             val config = repository.getConfig()
-            val savedStake = repository.getSavedCurrentStake(config.baseStake)
             val savedLosses = repository.getConsecutiveLosses()
             val savedDeficit = repository.getSavedRecoveryDeficit()
+            val savedStake = if (savedLosses == 0 && savedDeficit <= 0.01 && config.resetAfterWin) {
+                config.baseStake
+            } else {
+                repository.getSavedCurrentStake(config.baseStake)
+            }
             crashTracker.resetSession()
             if (activeBet == null) {
                 lockedRoundKey = null
@@ -584,6 +588,8 @@ class AutomationEngine(
         }
 
         scope.launch {
+            initJob?.join()
+            startJob?.join()
             val detected = currentDriver.detectBetTargetAt(handBounds)
             if (detected == null) {
                 val hasExternalSurface = currentDriver.hasExternalWindowAt(handBounds)
@@ -708,6 +714,8 @@ class AutomationEngine(
             return
         }
         scope.launch {
+            initJob?.join()
+            startJob?.join()
             val targetBounds = calibratedBetBounds ?: calibratedHandBounds
             val map = scheduler?.runScan(ScanReason.PRE_BET_S2, targetBounds)
                 ?: return@launch
@@ -788,6 +796,7 @@ class AutomationEngine(
         }
 
         // Only append newly confirmed live crashes (no bulk-importing pre-existing ribbon history)
+        val wasRunningBeforeCrash = _state.value.isRunning
         crashUpdate.newCrashMultipliers.forEachIndexed { idx, crashMult ->
             liveRecordedMultipliers.add(0, crashMult)
             while (liveRecordedMultipliers.size > 50) {
@@ -1029,7 +1038,7 @@ class AutomationEngine(
         }
 
         _state.update {
-            val syncedStake = if (!it.isRunning && it.consecutiveLosses == 0 && it.recoveryDeficit <= 0.01 && activeBet == null && pendingSettlementBet == null) {
+            val syncedStake = if (!it.isRunning && it.consecutiveLosses == 0 && it.recoveryDeficit <= 0.01 && config.resetAfterWin && activeBet == null && pendingSettlementBet == null) {
                 config.baseStake
             } else {
                 it.currentStake
@@ -1059,7 +1068,11 @@ class AutomationEngine(
                 patternSignalStage = evalResult.primaryProgress.signalStage,
                 isPatternMatched = evalResult.primaryProgress.isMatched && !evalResult.primaryProgress.isConsumed,
                 activeStrategyName = evalResult.primaryProgress.ruleName,
-                statusLine = buildStatusLine(map, decision, crashUpdate)
+                statusLine = if (wasRunningBeforeCrash && !it.isRunning && it.statusLine.startsWith("Stopped:")) {
+                    it.statusLine
+                } else {
+                    buildStatusLine(map, decision, crashUpdate)
+                }
             )
         }
 
@@ -1379,93 +1392,24 @@ class AutomationEngine(
     ) {
         roundCounter++
         val roundId = "R-$roundCounter"
-        val bet = activeBet ?: pendingSettlementBet
-        if (bet == null) {
-            lockedRoundKey = null
-            lockedAtMs = 0L
-            sawCancelOrFlightAfterBet = false
-            repository.recordRound(
-                RoundRecord(
-                    roundId = roundId,
-                    timestampMs = recordTimestampMs,
-                    crashMultiplier = crashMult,
-                    siteName = siteUrl
-                )
-            )
-            repository.log(
-                LogCategory.DETECTION,
-                "Current crash recorded: ${StakeCalculator.formatStake(crashMult)}x",
-                "Round $roundId (observation)"
-            )
-            return
-        }
-
-        val betSettlementKey = "${bet.placedAtMs}_${bet.roundSignature}"
-        if (betSettlementKey in settledBetSignatures) {
-            repository.recordRound(
-                RoundRecord(
-                    roundId = roundId,
-                    timestampMs = recordTimestampMs,
-                    crashMultiplier = crashMult,
-                    siteName = siteUrl
-                )
-            )
-            return
-        }
-        settledBetSignatures.add(betSettlementKey)
-        if (settledBetSignatures.size > 200) {
-            settledBetSignatures.remove(settledBetSignatures.first())
-        }
-
-        val outcome = resolveVerifiedOutcome(bet, crashMult, latestMap)
-        val won = outcome.won
-        val profitDelta = outcome.profitDelta
-
-        repository.recordRound(
-            RoundRecord(
-                roundId = roundId,
-                timestampMs = recordTimestampMs,
-                crashMultiplier = crashMult,
-                stakePlaced = bet.stake,
-                targetMultiplier = outcome.effectiveTarget,
-                won = won,
-                profitDelta = profitDelta,
-                strategyName = bet.strategyName,
-                siteName = siteUrl
-            )
-        )
-
-        releaseBetLock()
-        pendingSettlementBet = null
-
-        if (won == null) {
-            val unknownLine = "Outcome unknown (${StakeCalculator.formatStake(crashMult)}x) — recovery unchanged"
-            repository.log(LogCategory.RESULT, unknownLine, outcome.reason)
-            _state.update {
-                it.copy(
-                    statusLine = unknownLine,
-                    handState = FloatingHandState.WAITING,
-                    handStatusText = "Waiting"
-                )
-            }
-            return
-        }
-
+        val targetMult = config.cashOutTarget.coerceAtLeast(1.01)
+        val won = crashMult > targetMult
+        val currentStake = _state.value.currentStake
         val prevLosses = _state.value.consecutiveLosses
         val prevDeficit = _state.value.recoveryDeficit
+
         val progression = if (won) {
             StakeCalculator.onWin(
                 baseStake = config.baseStake,
-                previousStake = bet.stake,
+                previousStake = currentStake,
                 previousConsecutiveLosses = prevLosses,
-                currentDeficit = prevDeficit,
-                targetMultiplier = outcome.effectiveTarget,
-                resetAfterWin = config.resetAfterWin,
-                actualProfit = profitDelta
+                currentDeficit = 0.0,
+                targetMultiplier = targetMult,
+                resetAfterWin = config.resetAfterWin
             )
         } else {
             StakeCalculator.onLoss(
-                previousStake = bet.stake,
+                previousStake = currentStake,
                 baseStake = config.baseStake,
                 mode = config.afterLoss,
                 addAmount = config.addAmount,
@@ -1475,21 +1419,49 @@ class AutomationEngine(
             )
         }
 
+        val bet = activeBet ?: pendingSettlementBet
+        val stakePlaced = bet?.stake ?: currentStake
+        val profitDelta = if (bet != null) {
+            if (won) bet.stake * (targetMult - 1.0) else -bet.stake
+        } else {
+            0.0
+        }
+
+        repository.recordRound(
+            RoundRecord(
+                roundId = roundId,
+                timestampMs = recordTimestampMs,
+                crashMultiplier = crashMult,
+                stakePlaced = stakePlaced,
+                targetMultiplier = targetMult,
+                won = won,
+                profitDelta = profitDelta,
+                strategyName = bet?.strategyName ?: "Live Observation",
+                siteName = siteUrl
+            )
+        )
+
         repository.saveSessionProgression(progression.nextStake, progression.consecutiveLosses, progression.recoveryDeficit)
 
         val resultLine = if (won) {
-            "Won +${StakeCalculator.formatStake(profitDelta)} (${StakeCalculator.formatStake(crashMult)}x)"
+            "Won (${StakeCalculator.formatStake(crashMult)}x > ${StakeCalculator.formatStake(targetMult)}x) -> Reset stake"
         } else {
-            "Lost -${StakeCalculator.formatStake(bet.stake)} (${StakeCalculator.formatStake(crashMult)}x), next ${StakeCalculator.formatStake(progression.nextStake)}"
+            "Lost (${StakeCalculator.formatStake(crashMult)}x <= ${StakeCalculator.formatStake(targetMult)}x) -> Next stake ${StakeCalculator.formatStake(progression.nextStake)}"
         }
 
-        repository.log(LogCategory.RESULT, resultLine, "${outcome.reason} · Crash ${crashMult}x")
+        repository.log(LogCategory.RESULT, resultLine, "Crash ${StakeCalculator.formatStake(crashMult)}x")
+
+        releaseBetLock()
+        pendingSettlementBet = null
 
         _state.update {
             it.copy(
                 currentStake = progression.nextStake,
                 consecutiveLosses = progression.consecutiveLosses,
                 recoveryDeficit = progression.recoveryDeficit,
+                latestCrashMultiplier = crashMult,
+                monitoredCrashCount = crashTracker.monitoredCrashCount,
+                recordedMultipliers = liveRecordedMultipliers.toList(),
                 statusLine = resultLine,
                 handState = FloatingHandState.WAITING,
                 handStatusText = "Waiting"

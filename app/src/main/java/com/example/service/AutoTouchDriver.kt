@@ -56,6 +56,7 @@ interface DriverPlatform {
     fun findFocusedInput(): UiTarget?
     fun hasImeWindow(): Boolean
     fun performNodeClick(nodeId: String): Boolean
+    fun performFocus(nodeId: String): Boolean = false
     fun performSetText(nodeId: String, text: String): Boolean
     suspend fun dispatchTapGesture(x: Float, y: Float, durationMs: Long = 75L): Boolean
     fun performGlobalBack(): Boolean
@@ -266,9 +267,18 @@ class AndroidAccessibilityPlatform(
         return target != null && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 
+    override fun performFocus(nodeId: String): Boolean {
+        val node = nodeRegistry[nodeId] ?: return false
+        node.refresh()
+        return node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+    }
+
     override fun performSetText(nodeId: String, text: String): Boolean {
         val node = nodeRegistry[nodeId] ?: return false
         node.refresh()
+        if (!node.isFocused) {
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        }
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
@@ -477,17 +487,37 @@ class AutoTouchDriver(
                 delay(150L)
                 focused = platform.findFocusedInput()
             }
-            val horizOverlap = (minOf(focused?.bounds?.right ?: 0, fieldBounds.right) -
-                maxOf(focused?.bounds?.left ?: 0, fieldBounds.left)).coerceAtLeast(0)
+            val freshStakeTarget = platform.scanScreenWithPanel(preferredBetPanelBounds).stakeField
+            if (focused == null) {
+                val fallbackNodeId = freshStakeTarget?.nodeId?.takeIf { it.isNotBlank() } ?: initialTarget.nodeId
+                if (fallbackNodeId.isNotBlank()) {
+                    platform.performFocus(fallbackNodeId)
+                    delay(80L)
+                    focused = platform.findFocusedInput()
+                }
+            }
+            val referenceBounds = freshStakeTarget?.bounds ?: fieldBounds
+            val horizOverlap = (minOf(focused?.bounds?.right ?: 0, referenceBounds.right) -
+                maxOf(focused?.bounds?.left ?: 0, referenceBounds.left)).coerceAtLeast(0)
+            val imeVisibleNow = platform.hasImeWindow()
             val focusMatchesField = focused != null && (
-                focused.bounds.overlaps(fieldBounds) || (
+                focused.bounds.overlaps(fieldBounds) ||
+                    focused.bounds.overlaps(referenceBounds) || (
                     focused.isEditable &&
                         !focused.viewId.lowercase().contains("cash") &&
-                        horizOverlap >= minOf(fieldBounds.width, focused.bounds.width) / 2 &&
-                        abs(focused.bounds.centerY - fieldBounds.centerY) <= 450f
+                        !focused.viewId.lowercase().contains("auto") &&
+                        horizOverlap >= minOf(referenceBounds.width, focused.bounds.width) / 2 &&
+                        (abs(focused.bounds.centerY - referenceBounds.centerY) <= 450f ||
+                            (imeVisibleNow && focused.bounds.bottom <= fieldBounds.bottom + 80))
                     )
                 )
-            if (!focusMatchesField || focused == null) {
+            val entryTarget = when {
+                focusMatchesField && focused != null -> focused
+                focused == null && freshStakeTarget?.isEditable == true -> freshStakeTarget
+                focused == null && initialTarget.isEditable -> initialTarget
+                else -> null
+            }
+            if (entryTarget == null) {
                 if (attempt == 2) {
                     return FieldEntryResult(false, lastShownText, null, "wrong field focused")
                 }
@@ -495,24 +525,27 @@ class AutoTouchDriver(
                 continue
             }
 
-            if (!platform.performSetText(focused.nodeId, formattedText)) {
-                if (attempt == 2) {
-                    return FieldEntryResult(
-                        false,
-                        lastShownText,
-                        AccessibilityController.parseNumericValue(lastShownText),
-                        "$fieldLabel could not be set (field shows $lastShownText)"
-                    )
+            if (!platform.performSetText(entryTarget.nodeId, formattedText)) {
+                val retryNodeId = freshStakeTarget?.nodeId?.takeIf { it.isNotBlank() && it != entryTarget.nodeId }
+                if (retryNodeId == null || !platform.performSetText(retryNodeId, formattedText)) {
+                    if (attempt == 2) {
+                        return FieldEntryResult(
+                            false,
+                            lastShownText,
+                            AccessibilityController.parseNumericValue(lastShownText),
+                            "$fieldLabel could not be set (field shows $lastShownText)"
+                        )
+                    }
+                    delay(600L)
+                    continue
                 }
-                delay(600L)
-                continue
             }
 
             for (poll in 1..5) {
                 delay(100L)
                 val currentFocused = platform.findFocusedInput()
                 val textNow = currentFocused?.primaryText().orEmpty().ifBlank {
-                    findNodeMatchingBounds(fieldBounds, preferredBetPanelBounds)?.primaryText().orEmpty()
+                    findNodeMatchingBounds(referenceBounds, preferredBetPanelBounds)?.primaryText().orEmpty()
                 }
                 if (textNow.isNotBlank()) {
                     lastShownText = textNow
@@ -649,8 +682,17 @@ class AutoTouchDriver(
         preferredBetPanelBounds: RectBounds? = null
     ): UiTarget? {
         val scan = platform.scanScreenWithPanel(preferredBetPanelBounds)
-        val candidates = listOfNotNull(scan.stakeField)
-        return candidates.firstOrNull { it.bounds.overlaps(bounds) }
+        val candidate = scan.stakeField ?: return null
+        if (candidate.bounds.overlaps(bounds)) return candidate
+        val horizOverlap = (minOf(candidate.bounds.right, bounds.right) -
+            maxOf(candidate.bounds.left, bounds.left)).coerceAtLeast(0)
+        return if (horizOverlap >= minOf(candidate.bounds.width, bounds.width) / 2 &&
+            !candidate.viewId.lowercase().contains("cash")
+        ) {
+            candidate
+        } else {
+            null
+        }
     }
 
     private fun recordTap(x: Float, y: Float, timeMs: Long) {

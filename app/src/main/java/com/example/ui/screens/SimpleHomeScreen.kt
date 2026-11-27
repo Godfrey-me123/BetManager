@@ -585,7 +585,7 @@ fun SimpleHomeScreen(
                         subtitle = if (engineState.consecutiveLosses > 0) {
                             "${engineState.consecutiveLosses} loss streak · $afterLossLabel"
                         } else {
-                            "$afterLossLabel · Win >= ${StakeCalculator.formatStake(config.cashOutTarget)}x"
+                            "$afterLossLabel · Win > ${StakeCalculator.formatStake(config.cashOutTarget)}x"
                         },
                         modifier = Modifier.weight(1f)
                     )
