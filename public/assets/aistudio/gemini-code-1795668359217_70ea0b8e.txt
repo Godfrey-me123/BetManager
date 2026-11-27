@@ -1,0 +1,9 @@
+Update this BetManager project so betting is tied strictly to the rules I configure in the app—never to hardcoded color rules, fixed low-multiplier streaks, or unrequested fallback triggers:
+
+1. **Strict Configured-Rule Gating (`AutomationEngine.kt`, `StrategyEvaluator.kt`, `PatternDetectionEngine.kt`)**:
+   - Trigger bets only when a rule I explicitly configured and enabled is actually met (and `bettingMode` is not overriding rules with `BET_EVERY_ROUND` unless I selected that mode).
+   - Do not inject hardcoded low-multiplier streak requirements or hardcoded color assumptions into rules that do not configure them.
+   - Honour exact configured operators (`>=`, `>`, `<=`, `<`), thresholds, counts (including 0 or 1 when single-condition), and selected colors/HEX values.
+
+2. **Immediate Rule Sync (`BetManagerViewModel.kt`, `BetManagerRepository.kt`, `StrategyScreen.kt`)**:
+   - Ensure adding, editing, toggling, or deleting rules immediately saves to `BetManagerRepository` and updates live evaluation without stale rules or hardcoded defaults taking over.

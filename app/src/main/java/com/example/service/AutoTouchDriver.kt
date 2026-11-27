@@ -108,7 +108,7 @@ class AndroidAccessibilityPlatform(
 
     private fun captureCurrentNodes(): Triple<String, List<ScannedNode>, Boolean> {
         val windows = service.windows.orEmpty()
-        val hasIme = windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        val hasIme = windows.any { isVisibleImeWindow(it) }
         val roots = windows.mapNotNull { it.root }
             .ifEmpty { listOfNotNull(service.rootInActiveWindow) }
 
@@ -246,7 +246,16 @@ class AndroidAccessibilityPlatform(
     }
 
     override fun hasImeWindow(): Boolean =
-        service.windows.orEmpty().any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        service.windows.orEmpty().any { isVisibleImeWindow(it) }
+
+    private fun isVisibleImeWindow(window: AccessibilityWindowInfo): Boolean {
+        if (window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) return false
+        val bounds = Rect().also { window.getBoundsInScreen(it) }
+        if (bounds.isEmpty) return false
+        val displayHeight = runCatching { service.resources.displayMetrics.heightPixels }.getOrDefault(1920)
+        val minHeight = maxOf(150, (displayHeight * 0.12f).toInt())
+        return bounds.width() >= 200 && bounds.height() >= minHeight
+    }
 
     override fun performNodeClick(nodeId: String): Boolean {
         val node = nodeRegistry[nodeId] ?: return false
@@ -277,7 +286,7 @@ class AndroidAccessibilityPlatform(
             onPassThroughRequested?.invoke(true)
             if (onPassThroughRequested != null) {
                 // Allow SurfaceFlinger / WindowManager enough time to commit FLAG_NOT_TOUCHABLE
-                delay(90L)
+                delay(120L)
             }
             try {
                 suspendCancellableCoroutine { cont ->
@@ -301,7 +310,7 @@ class AndroidAccessibilityPlatform(
                     if (!accepted && cont.isActive) cont.resume(false)
                 }
             } finally {
-                delay(30L)
+                delay(50L)
                 onPassThroughRequested?.invoke(false)
             }
         }
@@ -463,8 +472,22 @@ class AutoTouchDriver(
             }
             delay(200L)
 
-            val focused = platform.findFocusedInput()
-            if (focused == null || !focused.bounds.overlaps(fieldBounds)) {
+            var focused = platform.findFocusedInput()
+            if (focused == null) {
+                delay(150L)
+                focused = platform.findFocusedInput()
+            }
+            val horizOverlap = (minOf(focused?.bounds?.right ?: 0, fieldBounds.right) -
+                maxOf(focused?.bounds?.left ?: 0, fieldBounds.left)).coerceAtLeast(0)
+            val focusMatchesField = focused != null && (
+                focused.bounds.overlaps(fieldBounds) || (
+                    focused.isEditable &&
+                        !focused.viewId.lowercase().contains("cash") &&
+                        horizOverlap >= minOf(fieldBounds.width, focused.bounds.width) / 2 &&
+                        abs(focused.bounds.centerY - fieldBounds.centerY) <= 450f
+                    )
+                )
+            if (!focusMatchesField || focused == null) {
                 if (attempt == 2) {
                     return FieldEntryResult(false, lastShownText, null, "wrong field focused")
                 }
@@ -514,36 +537,111 @@ class AutoTouchDriver(
         )
     }
 
+    data class LayoutSettleResult(
+        val scan: ScreenMap?,
+        val failureReason: String? = null
+    )
+
     /**
      * Section 2.3 (f):
      * Close keyboard (GLOBAL_ACTION_BACK only if an input-method window exists),
-     * wait until Bet button bounds are identical on two scans 120ms apart (timeout 1500ms),
-     * then return the fresh Bet button ScreenMap.
+     * verify that IME has actually closed, wait until Bet button bounds settle within 16px tolerance
+     * on two scans 120ms apart (timeout 1500ms), then return the fresh post-dismissal ScreenMap.
      */
     suspend fun closeKeyboardAndWaitLayoutSettle(
         settleIntervalMs: Long = 120L,
         timeoutMs: Long = 1500L,
         preferredBetPanelBounds: RectBounds? = null
-    ): ScreenMap? {
+    ): ScreenMap? = closeKeyboardAndWaitLayoutSettleDetailed(
+        settleIntervalMs = settleIntervalMs,
+        timeoutMs = timeoutMs,
+        preferredBetPanelBounds = preferredBetPanelBounds
+    ).scan
+
+    suspend fun closeKeyboardAndWaitLayoutSettleDetailed(
+        settleIntervalMs: Long = 120L,
+        timeoutMs: Long = 1500L,
+        preferredBetPanelBounds: RectBounds? = null
+    ): LayoutSettleResult {
+        var imeDismissAttempts = 0
         if (platform.hasImeWindow()) {
             platform.performGlobalBack()
+            imeDismissAttempts++
+            delay(maxOf(settleIntervalMs, 240L))
         }
 
         val deadline = platform.currentTimeMs() + timeoutMs
-        var previousBounds: RectBounds? = null
+        var previousBetBounds: RectBounds? = null
+        var previousStakeBounds: RectBounds? = null
+        var lastValidPostDismissScan: ScreenMap? = null
 
         while (true) {
             val scan = platform.scanScreenWithPanel(preferredBetPanelBounds)
-            val currentBounds = scan.betButton?.bounds
-            if (currentBounds != null && previousBounds != null && currentBounds == previousBounds) {
-                return scan
+            val imeStillOpen = scan.hasImeWindow || platform.hasImeWindow()
+            if (imeStillOpen) {
+                // Never fire a second GLOBAL_ACTION_BACK — Samsung/Android back animations can lag
+                // slightly and a second back exits Chrome/the game to the home screen.
+                if (imeDismissAttempts == 0) {
+                    platform.performGlobalBack()
+                    imeDismissAttempts++
+                }
+                previousBetBounds = null
+                previousStakeBounds = null
+                if (platform.currentTimeMs() >= deadline) {
+                    return LayoutSettleResult(
+                        scan = null,
+                        failureReason = "Keyboard did not close before layout settle timeout"
+                    )
+                }
+                delay(settleIntervalMs)
+                continue
             }
-            previousBounds = currentBounds
+
+            val liveBetBounds = scan.betButton?.bounds
+            val currentBetOrCalibrated = liveBetBounds
+                ?: if (preferredBetPanelBounds != null && !preferredBetPanelBounds.isEmpty && scan.stakeField != null) {
+                    preferredBetPanelBounds
+                } else {
+                    null
+                }
+            val currentStakeBounds = scan.stakeField?.bounds
+
+            if (currentBetOrCalibrated != null) {
+                lastValidPostDismissScan = scan
+                val betSettled = previousBetBounds != null && boundsWithinTolerance(currentBetOrCalibrated, previousBetBounds, 16)
+                val stakeSettled = if (liveBetBounds != null) {
+                    true
+                } else {
+                    currentStakeBounds != null && previousStakeBounds != null &&
+                        boundsWithinTolerance(currentStakeBounds, previousStakeBounds, 16)
+                }
+                if (betSettled && stakeSettled) {
+                    return LayoutSettleResult(scan = scan)
+                }
+            }
+            previousBetBounds = currentBetOrCalibrated
+            previousStakeBounds = currentStakeBounds
             if (platform.currentTimeMs() >= deadline) {
-                return null
+                return if (lastValidPostDismissScan != null) {
+                    LayoutSettleResult(scan = lastValidPostDismissScan)
+                } else {
+                    LayoutSettleResult(
+                        scan = null,
+                        failureReason = "Layout did not settle within ${timeoutMs}ms after keyboard close"
+                    )
+                }
             }
             delay(settleIntervalMs)
         }
+    }
+
+    private fun boundsWithinTolerance(a: RectBounds, b: RectBounds, tolerancePx: Int): Boolean {
+        return a == b || (
+            abs(a.left - b.left) <= tolerancePx &&
+                abs(a.top - b.top) <= tolerancePx &&
+                abs(a.right - b.right) <= tolerancePx &&
+                abs(a.bottom - b.bottom) <= tolerancePx
+            )
     }
 
     private fun findNodeMatchingBounds(

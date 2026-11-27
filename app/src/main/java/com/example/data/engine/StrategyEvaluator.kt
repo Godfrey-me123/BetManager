@@ -189,7 +189,20 @@ object StrategyEvaluator {
 
         return when (rule.type) {
             StrategyRuleType.CONSECUTIVE_LOW_MULTIPLIERS -> {
-                val needed = rule.consecutiveCount.coerceAtLeast(1)
+                val needed = rule.consecutiveCount
+                if (needed <= 0) {
+                    return PatternProgress(
+                        ruleName = rule.name,
+                        ruleType = rule.type,
+                        matchedCount = 0,
+                        requiredCount = 0,
+                        isMatched = false,
+                        signalStage = PatternSignalStage.NONE,
+                        progressPercent = 0f,
+                        conditionDescription = "Invalid count ($needed)",
+                        statusText = "Invalid rule: consecutive count must be >= 1"
+                    )
+                }
                 val lowStreak = recentRoundsNewestFirst.takeWhile { it.crashMultiplier < rule.thresholdMultiplier }
                 val streakCount = lowStreak.size
                 val matchedCount = streakCount.coerceAtMost(needed)
@@ -236,7 +249,20 @@ object StrategyEvaluator {
             }
 
             StrategyRuleType.CONSECUTIVE_HIGH_MULTIPLIERS -> {
-                val needed = rule.consecutiveCount.coerceAtLeast(1)
+                val needed = rule.consecutiveCount
+                if (needed <= 0) {
+                    return PatternProgress(
+                        ruleName = rule.name,
+                        ruleType = rule.type,
+                        matchedCount = 0,
+                        requiredCount = 0,
+                        isMatched = false,
+                        signalStage = PatternSignalStage.NONE,
+                        progressPercent = 0f,
+                        conditionDescription = "Invalid count ($needed)",
+                        statusText = "Invalid rule: consecutive count must be >= 1"
+                    )
+                }
                 val highStreak = recentRoundsNewestFirst.takeWhile { it.crashMultiplier >= rule.thresholdMultiplier }
                 val streakCount = highStreak.size
                 val matchedCount = streakCount.coerceAtMost(needed)
@@ -283,7 +309,20 @@ object StrategyEvaluator {
             }
 
             StrategyRuleType.COLOR_TIER_STREAK -> {
-                val needed = rule.consecutiveCount.coerceAtLeast(1)
+                val needed = rule.consecutiveCount
+                if (needed <= 0) {
+                    return PatternProgress(
+                        ruleName = rule.name,
+                        ruleType = rule.type,
+                        matchedCount = 0,
+                        requiredCount = 0,
+                        isMatched = false,
+                        signalStage = PatternSignalStage.NONE,
+                        progressPercent = 0f,
+                        conditionDescription = "Invalid count ($needed)",
+                        statusText = "Invalid rule: consecutive count must be >= 1"
+                    )
+                }
                 val targetTier = rule.colorTier.uppercase()
                 val tierStreak = recentRoundsNewestFirst.takeWhile { colorTierOf(it.crashMultiplier) == targetTier }
                 val streakCount = tierStreak.size
@@ -446,7 +485,20 @@ object StrategyEvaluator {
             }
 
             StrategyRuleType.TIME_COOLDOWN -> {
-                val wait = rule.waitRoundsAfterTrigger.coerceAtLeast(1)
+                val wait = rule.waitRoundsAfterTrigger
+                if (wait <= 0) {
+                    return PatternProgress(
+                        ruleName = rule.name,
+                        ruleType = rule.type,
+                        matchedCount = 0,
+                        requiredCount = 0,
+                        isMatched = false,
+                        signalStage = PatternSignalStage.NONE,
+                        progressPercent = 0f,
+                        conditionDescription = "Invalid wait rounds ($wait)",
+                        statusText = "Invalid rule: wait rounds must be >= 1"
+                    )
+                }
                 val hasEnough = recentRoundsNewestFirst.size >= wait + 1
                 val triggerRound = if (hasEnough) recentRoundsNewestFirst[wait] else null
                 val isMatched = triggerRound != null && triggerRound.crashMultiplier >= rule.thresholdMultiplier

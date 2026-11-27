@@ -88,7 +88,24 @@ class BetSequence(
         if (scan.phase != GamePhase.BETTING_OPEN) {
             return abort(stake, "Phase is ${scan.phase.name}, betting not open", LogCategory.SKIP)
         }
+        fun buildCalibratedBetTarget(currentScan: com.example.service.ScreenMap): com.example.service.UiTarget? {
+            if (preferredBetBounds == null || preferredBetBounds.isEmpty) return null
+            if (!currentScan.gameWindowFound || currentScan.phase != GamePhase.BETTING_OPEN) return null
+            if (currentScan.cancelButton != null || currentScan.stakeField == null) return null
+            return com.example.service.UiTarget(
+                nodeId = "",
+                viewId = "calibrated_bet_target",
+                text = "BET",
+                contentDescription = "Calibrated BET coordinate",
+                bounds = preferredBetBounds,
+                isClickable = true,
+                isEnabled = true,
+                isVisible = true
+            )
+        }
+
         val initialBetButton = scan.betButton
+            ?: buildCalibratedBetTarget(scan)
             ?: return abort(stake, "Bet button not found", LogCategory.SKIP)
         if (!initialBetButton.isEnabled || !initialBetButton.isVisible) {
             return abort(stake, "Bet button disabled or hidden", LogCategory.SKIP)
@@ -96,7 +113,7 @@ class BetSequence(
         val initialStakeField = scan.stakeField
             ?: return abort(stake, "Stake box not found", LogCategory.ERROR)
 
-        // Balance checks
+        // Balance checks (non-blocking if balance is temporarily unreadable unless balanceFloor > 0)
         if (config.balanceFloor > 0.0) {
             val bal = scan.balance
             if (bal == null) {
@@ -118,86 +135,127 @@ class BetSequence(
             return abort(stake, "Bet window budget expired", LogCategory.SKIP)
         }
 
-        // 4. Set stake with AutoTouchDriver
+        // 4. Set stake with AutoTouchDriver (skip typing if game field already shows target stake within tolerance)
         val formattedStake = StakeCalculator.formatStake(stake)
-        onLog(LogCategory.STAKE, "Setting stake $formattedStake", "Target bounds ${initialStakeField.bounds}")
+        val existingStakeVal = AccessibilityController.parseNumericValue(initialStakeField.primaryText())
+        val stakeAlreadyMatches = existingStakeVal != null && abs(existingStakeVal - stake) <= config.stakeTolerance
 
-        val stakeEntry = driver.setVerifiedNumericField(
-            fieldBounds = initialStakeField.bounds,
-            initialTarget = initialStakeField,
-            expectedValue = stake,
-            formattedText = formattedStake,
-            tolerance = config.stakeTolerance,
-            fieldLabel = "stake",
-            preferredBetPanelBounds = preferredBetBounds
-        )
-        if (!stakeEntry.success) {
-            return abort(
+        val freshStakeReadBack: String
+        val freshBetButton: com.example.service.UiTarget
+        val usingHandIndex: Int
+
+        if (stakeAlreadyMatches && !scan.hasImeWindow) {
+            onLog(
+                LogCategory.STAKE,
+                "Stake already $formattedStake",
+                "Field shows '${initialStakeField.primaryText()}' — skipping stake edit"
+            )
+            freshStakeReadBack = initialStakeField.primaryText()
+            freshBetButton = initialBetButton
+            usingHandIndex = scan.usingHandIndex
+        } else {
+            val stakeReadText: String
+            if (stakeAlreadyMatches) {
+                onLog(
+                    LogCategory.STAKE,
+                    "Stake already $formattedStake (closing IME)",
+                    "Field shows '${initialStakeField.primaryText()}' — dismissing keyboard before tap"
+                )
+                stakeReadText = initialStakeField.primaryText()
+            } else {
+                onLog(LogCategory.STAKE, "Setting stake $formattedStake", "Target bounds ${initialStakeField.bounds}")
+
+                val stakeEntry = driver.setVerifiedNumericField(
+                    fieldBounds = initialStakeField.bounds,
+                    initialTarget = initialStakeField,
+                    expectedValue = stake,
+                    formattedText = formattedStake,
+                    tolerance = config.stakeTolerance,
+                    fieldLabel = "stake",
+                    preferredBetPanelBounds = preferredBetBounds
+                )
+                if (!stakeEntry.success) {
+                    return abort(
+                        stake,
+                        stakeEntry.errorReason ?: "stake could not be set (field shows ${stakeEntry.readBackText})",
+                        LogCategory.ERROR,
+                        stakeReadBack = stakeEntry.readBackText
+                    )
+                }
+                stakeReadText = stakeEntry.readBackText
+            }
+
+            if (budgetExpired()) {
+                return abort(stake, "Bet window budget expired before layout settle", LogCategory.SKIP, stakeReadText)
+            }
+
+            // 5. Close keyboard if present, verify IME closed, settle layout, re-find Bet & verify stake
+            val settleResult = driver.closeKeyboardAndWaitLayoutSettleDetailed(
+                settleIntervalMs = 120L,
+                timeoutMs = 1500L,
+                preferredBetPanelBounds = preferredBetBounds
+            )
+            val settledScan = settleResult.scan ?: return abort(
                 stake,
-                stakeEntry.errorReason ?: "stake could not be set (field shows ${stakeEntry.readBackText})",
+                settleResult.failureReason ?: "Layout did not settle after keyboard close",
                 LogCategory.ERROR,
-                stakeReadBack = stakeEntry.readBackText
+                stakeReadText
             )
-        }
 
-        if (budgetExpired()) {
-            return abort(stake, "Bet window budget expired before layout settle", LogCategory.SKIP, stakeEntry.readBackText)
-        }
+            if (settledScan.phase != GamePhase.BETTING_OPEN) {
+                return abort(
+                    stake,
+                    "Phase closed before Bet tap (${settledScan.phase.name})",
+                    LogCategory.SKIP,
+                    stakeReadText
+                )
+            }
 
-        // 5. Close keyboard if present, settle layout, re-find Bet & verify stake
-        val settledScan = driver.closeKeyboardAndWaitLayoutSettle(
-            settleIntervalMs = 120L,
-            timeoutMs = 1500L,
-            preferredBetPanelBounds = preferredBetBounds
-        ) ?: return abort(stake, "Layout did not settle after keyboard close", LogCategory.ERROR, stakeEntry.readBackText)
+            val freshStakeField = settledScan.stakeField
+                ?: return abort(stake, "Stake box vanished after layout settle", LogCategory.ERROR, stakeReadText)
+            val reVerifiedValue = AccessibilityController.parseNumericValue(freshStakeField.primaryText())
+            if (reVerifiedValue == null || abs(reVerifiedValue - stake) > config.stakeTolerance) {
+                return abort(
+                    stake,
+                    "stake could not be verified after settle (field shows ${freshStakeField.primaryText()})",
+                    LogCategory.ERROR,
+                    freshStakeField.primaryText()
+                )
+            }
 
-        if (settledScan.phase != GamePhase.BETTING_OPEN) {
-            return abort(
-                stake,
-                "Phase closed before Bet tap (${settledScan.phase.name})",
-                LogCategory.SKIP,
-                stakeEntry.readBackText
-            )
-        }
+            val settledBetBtn = settledScan.betButton
+                ?: buildCalibratedBetTarget(settledScan)
+                ?: return abort(stake, "Bet button vanished after settle", LogCategory.ERROR, freshStakeField.primaryText())
+            if (!settledBetBtn.isEnabled || !settledBetBtn.isVisible) {
+                return abort(stake, "Bet button disabled after settle", LogCategory.SKIP, freshStakeField.primaryText())
+            }
 
-        val freshStakeField = settledScan.stakeField
-            ?: return abort(stake, "Stake box vanished after layout settle", LogCategory.ERROR, stakeEntry.readBackText)
-        val reVerifiedValue = AccessibilityController.parseNumericValue(freshStakeField.primaryText())
-        if (reVerifiedValue == null || abs(reVerifiedValue - stake) > config.stakeTolerance) {
-            return abort(
-                stake,
-                "stake could not be verified after settle (field shows ${freshStakeField.primaryText()})",
-                LogCategory.ERROR,
-                freshStakeField.primaryText()
-            )
-        }
+            if (budgetExpired()) {
+                return abort(stake, "Bet window budget expired before tap", LogCategory.SKIP, freshStakeField.primaryText())
+            }
 
-        val freshBetButton = settledScan.betButton
-            ?: return abort(stake, "Bet button vanished after settle", LogCategory.ERROR, freshStakeField.primaryText())
-        if (!freshBetButton.isEnabled || !freshBetButton.isVisible) {
-            return abort(stake, "Bet button disabled after settle", LogCategory.SKIP, freshStakeField.primaryText())
-        }
-
-        if (budgetExpired()) {
-            return abort(stake, "Bet window budget expired before tap", LogCategory.SKIP, freshStakeField.primaryText())
+            freshStakeReadBack = freshStakeField.primaryText()
+            freshBetButton = settledBetBtn
+            usingHandIndex = settledScan.usingHandIndex
         }
 
         // 6. Tap the Bet button (overlay pass-through handled by driver)
         val tapResult = driver.clickTarget(freshBetButton, allowDebounceSkip = true)
         if (!tapResult.isProceedable) {
-            return abort(stake, "Bet tap failed: ${tapResult.reason}", LogCategory.ERROR, freshStakeField.primaryText())
+            return abort(stake, "Bet tap failed: ${tapResult.reason}", LogCategory.ERROR, freshStakeReadBack)
         }
 
         onLog(
             LogCategory.BET,
             "Bet tapped $formattedStake",
-            "Wanted $formattedStake, read back '${freshStakeField.primaryText()}', method=${tapResult.outcome}"
+            "Wanted $formattedStake, read back '$freshStakeReadBack', method=${tapResult.outcome}"
         )
 
-        // 7. Confirm (S3): Cancel button visible or round started (max 3 polls @ 150ms)
+        // 7. Confirm (S3): Cancel button visible or round started (up to 6 polls @ 200ms within budget)
         var confirmed = false
-        for (poll in 1..3) {
-            delay(150L)
+        for (poll in 1..6) {
+            if (budgetExpired()) break
+            delay(200L)
             val confirmScan = scheduler.runScan(ScanReason.CONFIRM_S3, preferredBetBounds)
             if (confirmScan.cancelButton != null || confirmScan.phase == GamePhase.IN_FLIGHT) {
                 confirmed = true
@@ -215,9 +273,9 @@ class BetSequence(
                 placed = true,
                 confirmed = true,
                 stakeWanted = stake,
-                stakeReadBack = freshStakeField.primaryText(),
+                stakeReadBack = freshStakeReadBack,
                 reason = "Bet placed $formattedStake",
-                usingHandIndex = settledScan.usingHandIndex
+                usingHandIndex = usingHandIndex
             )
         } else {
             onLog(
@@ -229,9 +287,9 @@ class BetSequence(
                 placed = false,
                 confirmed = false,
                 stakeWanted = stake,
-                stakeReadBack = freshStakeField.primaryText(),
+                stakeReadBack = freshStakeReadBack,
                 reason = "bet not confirmed",
-                usingHandIndex = settledScan.usingHandIndex
+                usingHandIndex = usingHandIndex
             )
         }
     }

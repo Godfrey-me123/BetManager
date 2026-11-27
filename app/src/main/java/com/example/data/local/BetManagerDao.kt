@@ -6,7 +6,15 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Update
+import com.example.data.model.AlarmProfileEntity
+import com.example.data.model.CrashRecord
+import com.example.data.model.CustomPatternStrategy
 import com.example.data.model.DiagnosticLogEntry
+import com.example.data.model.MultiplierRecord
+import com.example.data.model.NotificationHistoryRecord
+import com.example.data.model.NotificationInteractionStatus
+import com.example.data.model.NotificationSettings
+import com.example.data.model.PatternOccurrenceRecord
 import com.example.data.model.RoundRecord
 import com.example.data.model.StrategyConfig
 import com.example.data.model.StrategyRule
@@ -14,10 +22,10 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface BetManagerDao {
-    @Query("SELECT * FROM strategy_config WHERE id = 1")
+    @Query("SELECT * FROM strategy_configs WHERE id = 1")
     fun observeConfig(): Flow<StrategyConfig?>
 
-    @Query("SELECT * FROM strategy_config WHERE id = 1")
+    @Query("SELECT * FROM strategy_configs WHERE id = 1")
     suspend fun getConfig(): StrategyConfig?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -44,6 +52,9 @@ interface BetManagerDao {
     @Delete
     suspend fun deleteRule(rule: StrategyRule)
 
+    @Query("DELETE FROM strategy_rules WHERE name IN (:names)")
+    suspend fun deleteRulesByNames(names: List<String>)
+
     @Query("SELECT * FROM round_records ORDER BY timestampMs DESC, id DESC LIMIT 200")
     fun observeRecentRounds(): Flow<List<RoundRecord>>
 
@@ -53,10 +64,10 @@ interface BetManagerDao {
     @Query("SELECT * FROM round_records ORDER BY timestampMs DESC, id DESC LIMIT 50")
     suspend fun getRecentRoundsOnce(): List<RoundRecord>
 
-    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL")
+    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
     fun observeTodayProfit(dayStartMs: Long): Flow<Double>
 
-    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL")
+    @Query("SELECT COALESCE(SUM(profitDelta), 0.0) FROM round_records WHERE timestampMs >= :dayStartMs AND stakePlaced IS NOT NULL AND won IS NOT NULL")
     suspend fun getTodayProfitOnce(dayStartMs: Long): Double
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -73,4 +84,96 @@ interface BetManagerDao {
 
     @Query("DELETE FROM diagnostic_logs")
     suspend fun clearLogs()
+
+    // --- 4-Strategy Custom Pattern Architecture ---
+
+    @Query("SELECT * FROM custom_pattern_strategies ORDER BY sortOrder ASC, id ASC")
+    fun observeCustomStrategies(): Flow<List<CustomPatternStrategy>>
+
+    @Query("SELECT * FROM custom_pattern_strategies ORDER BY sortOrder ASC, id ASC")
+    suspend fun getCustomStrategies(): List<CustomPatternStrategy>
+
+    @Query("SELECT * FROM custom_pattern_strategies WHERE id = :id")
+    suspend fun getCustomStrategyById(id: Long): CustomPatternStrategy?
+
+    @Query("SELECT COALESCE(MAX(sortOrder), -1) FROM custom_pattern_strategies")
+    suspend fun getMaxCustomStrategySortOrder(): Int
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertCustomStrategy(strategy: CustomPatternStrategy): Long
+
+    @Update
+    suspend fun updateCustomStrategy(strategy: CustomPatternStrategy)
+
+    @Query("UPDATE custom_pattern_strategies SET isEnabled = :enabled WHERE id = :id")
+    suspend fun setCustomStrategyEnabled(id: Long, enabled: Boolean)
+
+    @Query("UPDATE custom_pattern_strategies SET notificationEnabled = :enabled WHERE id = :id")
+    suspend fun setCustomStrategyNotificationsEnabled(id: Long, enabled: Boolean)
+
+    @Query("DELETE FROM custom_pattern_strategies WHERE id = :id")
+    suspend fun deleteCustomStrategyById(id: Long)
+
+    @Query("SELECT * FROM pattern_occurrences ORDER BY triggerTimestampMs DESC, id DESC LIMIT 500")
+    fun observePatternOccurrences(): Flow<List<PatternOccurrenceRecord>>
+
+    @Query("SELECT * FROM pattern_occurrences ORDER BY triggerTimestampMs ASC, id ASC")
+    suspend fun getPatternOccurrences(): List<PatternOccurrenceRecord>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPatternOccurrence(record: PatternOccurrenceRecord): Long
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPatternOccurrences(records: List<PatternOccurrenceRecord>)
+
+    @Query("SELECT * FROM crash_records ORDER BY crashTimestamp ASC, id ASC")
+    fun observeCrashRecords(): Flow<List<CrashRecord>>
+
+    @Query("SELECT * FROM crash_records ORDER BY crashTimestamp ASC, id ASC")
+    suspend fun getCrashRecords(): List<CrashRecord>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertCrashRecord(record: CrashRecord): Long
+
+    @Query("SELECT * FROM multiplier_records ORDER BY crashTimestamp ASC, id ASC")
+    fun observeMultiplierRecords(): Flow<List<MultiplierRecord>>
+
+    @Query("SELECT * FROM multiplier_records ORDER BY crashTimestamp ASC, id ASC")
+    suspend fun getMultiplierRecords(): List<MultiplierRecord>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertMultiplierRecord(record: MultiplierRecord): Long
+
+    @Query("SELECT * FROM alarm_profiles")
+    fun observeAlarmProfiles(): Flow<List<AlarmProfileEntity>>
+
+    @Query("SELECT * FROM alarm_profiles")
+    suspend fun getAlarmProfiles(): List<AlarmProfileEntity>
+
+    @Query("SELECT * FROM alarm_profiles WHERE categoryName = :categoryName")
+    suspend fun getAlarmProfile(categoryName: String): AlarmProfileEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAlarmProfile(profile: AlarmProfileEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAlarmProfiles(profiles: List<AlarmProfileEntity>)
+
+    @Query("SELECT * FROM notification_settings WHERE id = 1")
+    fun observeNotificationSettings(): Flow<NotificationSettings?>
+
+    @Query("SELECT * FROM notification_settings WHERE id = 1")
+    suspend fun getNotificationSettings(): NotificationSettings?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertNotificationSettings(settings: NotificationSettings)
+
+    @Query("SELECT * FROM notification_history ORDER BY timestampMs DESC, id DESC LIMIT 200")
+    fun observeNotificationHistory(): Flow<List<NotificationHistoryRecord>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertNotificationHistory(record: NotificationHistoryRecord): Long
+
+    @Query("UPDATE notification_history SET interactionStatus = :status WHERE id = :id")
+    suspend fun updateNotificationInteractionStatus(id: Long, status: NotificationInteractionStatus)
 }

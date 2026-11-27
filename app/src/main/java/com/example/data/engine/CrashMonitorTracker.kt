@@ -39,6 +39,7 @@ class CrashMonitorTracker {
     private var previousPhase: GamePhase = GamePhase.UNKNOWN
     private var pendingCrashFromBanner: Double? = null
     private var lastBannerCrashRecordedAtMs: Long = 0L
+    private var initialBannerObserved: Boolean = false
 
     fun resetSession() {
         status = CrashMonitorStatus.IDLE
@@ -48,6 +49,7 @@ class CrashMonitorTracker {
         previousPhase = GamePhase.UNKNOWN
         pendingCrashFromBanner = null
         lastBannerCrashRecordedAtMs = 0L
+        initialBannerObserved = false
     }
 
     fun onScreenSnapshot(
@@ -120,30 +122,41 @@ class CrashMonitorTracker {
         }
 
         // 2. Detect live CRASHED banner / IN_FLIGHT -> BETTING_OPEN transition immediately
-        val isCrashTransition = map.phase == GamePhase.CRASHED ||
-            (previousPhase == GamePhase.IN_FLIGHT && map.phase == GamePhase.BETTING_OPEN)
+        val bannerCrash = map.lastCrashMultiplier?.takeIf { it.isFinite() && it >= 1.0 }
 
-        if (isCrashTransition && newlyRecorded.isEmpty()) {
-            val bannerCrash = map.lastCrashMultiplier?.takeIf { it.isFinite() && it >= 1.0 }
-            val alreadyPending = bannerCrash != null &&
-                pendingCrashFromBanner != null &&
-                abs(pendingCrashFromBanner!! - bannerCrash) < 0.009 &&
-                (nowMs - lastBannerCrashRecordedAtMs) < 15_000L
-
-            if (bannerCrash != null && !alreadyPending &&
-                (previousPhase != GamePhase.CRASHED || pendingCrashFromBanner == null)
-            ) {
+        if (!initialBannerObserved) {
+            initialBannerObserved = true
+            if (bannerCrash != null) {
+                // First crash-banner observation is a baseline only — not automatically a new crash
                 pendingCrashFromBanner = bannerCrash
                 lastBannerCrashRecordedAtMs = nowMs
-                newlyRecorded += bannerCrash
-                monitoredCrashCount++
                 latestCrashMultiplier = bannerCrash
-                status = CrashMonitorStatus.TRACKING_LIVE
-                summary = "Recorded current crash ${formatMult(bannerCrash)}x"
             }
-        } else if (map.phase == GamePhase.IN_FLIGHT) {
-            // New round started flying -> clear any prior round banner marker
-            pendingCrashFromBanner = null
+        } else {
+            val isCrashTransition = map.phase == GamePhase.CRASHED ||
+                (previousPhase == GamePhase.IN_FLIGHT && map.phase == GamePhase.BETTING_OPEN)
+
+            if (isCrashTransition && newlyRecorded.isEmpty()) {
+                val alreadyPending = bannerCrash != null &&
+                    pendingCrashFromBanner != null &&
+                    abs(pendingCrashFromBanner!! - bannerCrash) < 0.009 &&
+                    (nowMs - lastBannerCrashRecordedAtMs) < 15_000L
+
+                if (bannerCrash != null && !alreadyPending &&
+                    (previousPhase != GamePhase.CRASHED || pendingCrashFromBanner == null)
+                ) {
+                    pendingCrashFromBanner = bannerCrash
+                    lastBannerCrashRecordedAtMs = nowMs
+                    newlyRecorded += bannerCrash
+                    monitoredCrashCount++
+                    latestCrashMultiplier = bannerCrash
+                    status = CrashMonitorStatus.TRACKING_LIVE
+                    summary = "Recorded current crash ${formatMult(bannerCrash)}x"
+                }
+            } else if (map.phase == GamePhase.IN_FLIGHT) {
+                // New round started flying -> clear any prior round banner marker
+                pendingCrashFromBanner = null
+            }
         }
 
         previousPhase = map.phase

@@ -1,0 +1,5 @@
+Add a clean diagnostic log export / share helper in this BetManager Android project so I can copy or share recent logs (including timestamps, category, summary, and details) when troubleshooting issues:
+
+1. **Log Formatting & Share Action (`LogsScreen.kt`, `BetManagerViewModel.kt`, `BetManagerRepository.kt`)**:
+   - Add a "Copy Logs" and/or "Share Logs" button on `LogsScreen` that formats recent `DiagnosticLogEntry` items (e.g., last 100–200 entries with timestamp, category, message, and details) into readable plain text and copies it to the clipboard or opens Android's `Intent.ACTION_SEND` share sheet.
+   - Include key live state context at the top of the exported log text (such as `isRunning`, `currentStake`, `consecutiveLosses`, `recoveryDeficit`, `balance`, `latestCrashMultiplier`, `phase`, and active `StrategyConfig` summary) without altering existing log storage or screen layout.

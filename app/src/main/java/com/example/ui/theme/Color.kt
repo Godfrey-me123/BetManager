@@ -22,3 +22,8 @@ val GoldContainer = Color(0xFFEBDFC6)
 
 val CoralDanger = Color(0xFFB0524A)
 val CoralContainer = Color(0xFFEBD3D0)
+
+val PrimaryCobalt = Color(0xFF2563EB)
+val ActionStartEmerald = Color(0xFF16A34A)
+val ActionCashOutAmber = Color(0xFFD97706)
+val ActionStopRed = Color(0xFFDC2626)

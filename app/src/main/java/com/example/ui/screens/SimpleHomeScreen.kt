@@ -69,6 +69,8 @@ fun SimpleHomeScreen(
     onToggleFloatingHand: (Boolean) -> Unit,
     onToggleHandAutoBet: (Boolean) -> Unit = {},
     onToggleKeepScreenAwake: (Boolean) -> Unit = {},
+    onCancelAlarm: () -> Unit = {},
+    onSwitchToOverlay: () -> Unit = {},
     onExitApp: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -112,30 +114,83 @@ fun SimpleHomeScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    Surface(
-                        color = statusColor.copy(alpha = 0.16f),
-                        shape = RoundedCornerShape(50),
-                        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f))
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (engineState.serviceConnected) {
+                            androidx.compose.material3.OutlinedButton(
+                                onClick = onSwitchToOverlay,
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                                modifier = Modifier.testTag("overlay_mode_button")
+                            ) {
+                                Text("Overlay", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                        Surface(
+                            color = statusColor.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(50),
+                            border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(statusColor)
+                                )
+                                Text(
+                                    text = when {
+                                        !engineState.serviceConnected -> "Service Off"
+                                        engineState.isRunning -> "Active"
+                                        else -> "Ready"
+                                    },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = statusColor
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (engineState.isAlarmActive) {
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = CoralDanger.copy(alpha = 0.16f)),
+                        border = BorderStroke(1.5.dp, CoralDanger),
+                        modifier = Modifier.testTag("cancel_alarm_banner")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(statusColor)
-                            )
-                            Text(
-                                text = when {
-                                    !engineState.serviceConnected -> "Service Off"
-                                    engineState.isRunning -> "Active"
-                                    else -> "Ready"
-                                },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = statusColor
+                            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(
+                                    text = engineState.activeAlarmTitle ?: "Pattern Alarm Ringing",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = CoralDanger
+                                )
+                                Text(
+                                    text = "Tap Stop Alarm to silence sound and notification.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            BmButton(
+                                text = "Stop Alarm",
+                                onClick = onCancelAlarm,
+                                kind = BmButtonKind.STOP,
+                                icon = Icons.Filled.Stop,
+                                modifier = Modifier.testTag("cancel_alarm_button")
                             )
                         }
                     }
@@ -519,13 +574,18 @@ fun SimpleHomeScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
+                    val afterLossLabel = when (config.afterLoss) {
+                        com.example.data.model.AfterLossMode.DOUBLE -> "Double"
+                        com.example.data.model.AfterLossMode.ADD -> "Add"
+                        com.example.data.model.AfterLossMode.KEEP -> "Keep"
+                    }
                     MetricTile(
                         label = "CURRENT STAKE",
                         value = "${StakeCalculator.formatStake(engineState.currentStake)} ${engineState.currency}",
                         subtitle = if (engineState.consecutiveLosses > 0) {
-                            "${engineState.consecutiveLosses} loss streak"
+                            "${engineState.consecutiveLosses} loss streak · $afterLossLabel"
                         } else {
-                            "Base stake active"
+                            "$afterLossLabel · Win >= ${StakeCalculator.formatStake(config.cashOutTarget)}x"
                         },
                         modifier = Modifier.weight(1f)
                     )
@@ -604,7 +664,12 @@ fun SimpleHomeScreen(
                         } else {
                             lastFiveResults.forEach { record ->
                                 val isWin = record.won == true
-                                val badgeColor = if (isWin) EmeraldPrimary else CoralDanger
+                                val isUnknown = record.won == null
+                                val badgeColor = when (record.won) {
+                                    true -> EmeraldPrimary
+                                    false -> CoralDanger
+                                    null -> GoldAccent
+                                }
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -619,14 +684,22 @@ fun SimpleHomeScreen(
                                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Filled.CheckCircle,
-                                            contentDescription = if (isWin) "Win" else "Loss",
+                                            imageVector = if (isUnknown) Icons.Outlined.Info else Icons.Filled.CheckCircle,
+                                            contentDescription = when (record.won) {
+                                                true -> "Win"
+                                                false -> "Loss"
+                                                null -> "Unknown"
+                                            },
                                             tint = badgeColor,
                                             modifier = Modifier.size(18.dp)
                                         )
                                         Column {
                                             Text(
-                                                text = if (isWin) "WIN" else "LOSS",
+                                                text = when (record.won) {
+                                                    true -> "WIN"
+                                                    false -> "LOSS"
+                                                    null -> "UNKNOWN"
+                                                },
                                                 style = MaterialTheme.typography.labelLarge,
                                                 color = badgeColor
                                             )
@@ -638,7 +711,7 @@ fun SimpleHomeScreen(
                                         }
                                     }
                                     Text(
-                                        text = formatSignedProfit(record.profitDelta, engineState.currency),
+                                        text = if (isUnknown) "--" else formatSignedProfit(record.profitDelta, engineState.currency),
                                         fontFamily = MonoFontFamily,
                                         fontWeight = FontWeight.Bold,
                                         color = badgeColor

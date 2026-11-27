@@ -7,6 +7,7 @@ import com.example.data.engine.AutomationEngine
 import com.example.data.engine.BetSequence
 import com.example.data.engine.CrashMonitorStatus
 import com.example.data.engine.CrashMonitorTracker
+import com.example.data.engine.PatternProgress
 import com.example.data.engine.PatternSignalStage
 import com.example.data.engine.StakeCalculator
 import com.example.data.engine.StrategyDecision
@@ -23,6 +24,7 @@ import com.example.service.AutoTouchDriver
 import com.example.service.DetectedHandTarget
 import com.example.service.DriverPlatform
 import com.example.service.GamePhase
+import com.example.service.PatternAlertManager
 import com.example.service.RectBounds
 import com.example.service.ScanScheduler
 import com.example.service.ScannedNode
@@ -31,6 +33,7 @@ import com.example.service.UiTarget
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
@@ -928,6 +931,154 @@ class BetManagerRulesTest {
             assertFalse(repo.preSignalNotificationFlow.value)
             assertFalse(repo.alertSoundFlow.value)
             assertFalse(repo.alertVibrationFlow.value)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `T21 Double Add and Keep after-loss progression settles accurately even when BETTING_OPEN precedes crash ribbon`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val dao = db.betManagerDao()
+            val repo = BetManagerRepository(context, dao)
+            repo.saveConfig(
+                StrategyConfig(
+                    baseStake = 20.0,
+                    afterLoss = AfterLossMode.DOUBLE,
+                    addAmount = 15.0,
+                    stopAfterLosses = 0,
+                    cashOutTarget = 2.0,
+                    bettingMode = BettingMode.BET_EVERY_ROUND
+                )
+            )
+
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val engineScope = CoroutineScope(SupervisorJob() + dispatcher)
+            val platform = FakeDriverPlatform(clockMs = { testScheduler.currentTime }, preferRealTouchGesture = true)
+            platform.nodes = buildBetPawaTree(planeFlying = true, stakeValue = "20.00")
+
+            val driver = AutoTouchDriver(platform)
+            val scheduler = ScanScheduler(platform, scanDispatcher = dispatcher, timeProvider = { testScheduler.currentTime })
+            val engine = AutomationEngine(repo, engineScope)
+            engine.attachAccessibility(driver, scheduler)
+            engine.start()
+            runCurrent()
+
+            // Switch game UI to BETTING_OPEN
+            platform.nodes = buildBetPawaTree(betClickable = true, betEnabled = true, stakeValue = "20.00")
+
+            fun mapWithRibbon(ts: Long, phase: GamePhase, ribbon: List<Double>): ScreenMap =
+                ScreenMap(
+                    timestampMs = ts,
+                    packageName = "com.android.chrome",
+                    phase = phase,
+                    ribbonMultipliers = ribbon,
+                    autoCashOutState = com.example.service.SwitchState.ON,
+                    autoCashOutTarget = 2.0,
+                    betButton = if (phase == GamePhase.BETTING_OPEN) {
+                        UiTarget("bet_btn_top", RectBounds(520, 1100, 980, 1240), text = "Bet", isEnabled = true, isClickable = true)
+                    } else null,
+                    stakeField = UiTarget("stake_field", RectBounds(140, 1120, 380, 1200), text = "20.00", className = "android.widget.EditText", isEditable = true, isClickable = true)
+                )
+
+            // 1. Baseline & first auto bet at 20.00
+            engine.handleScreenEvent(mapWithRibbon(1000L, GamePhase.BETTING_OPEN, listOf(3.10, 4.20)))
+            assertEquals(20.0, engine.state.value.currentStake, 0.01)
+            val diagLogs = dao.observeLogs().firstOrNull().orEmpty().joinToString(" | ") { "${it.category}:${it.message}" }
+            val diagCfg = repo.getConfig()
+            assertTrue(
+                "Expected active bet lock; status='${engine.state.value.statusLine}', mode=${diagCfg.bettingMode}, isRunning=${engine.state.value.isRunning}, taps=${platform.gestureTaps.size}, scans=${platform.scanCount}, logs=[$diagLogs]",
+                engine.hasActiveBetLock()
+            )
+
+            // 2. Plane flies, then BETTING_OPEN appears 1 scan BEFORE ribbon updates with crash 1.35x!
+            platform.simulateNewRoundResetCancel()
+            engine.handleScreenEvent(mapWithRibbon(4000L, GamePhase.IN_FLIGHT, listOf(3.10, 4.20)))
+            engine.handleScreenEvent(mapWithRibbon(6000L, GamePhase.BETTING_OPEN, listOf(3.10, 4.20)))
+
+            // 3. Now ribbon updates with 1.35x (< 2.00x loss) -> pendingSettlementBet settles -> stake MUST double to 40.0 & type 40.00!
+            engine.handleScreenEvent(mapWithRibbon(7000L, GamePhase.BETTING_OPEN, listOf(1.35, 3.10, 4.20)))
+            assertEquals(40.0, engine.state.value.currentStake, 0.01)
+            assertEquals(1, engine.state.value.consecutiveLosses)
+            assertEquals("40.00", platform.setTextCalls.last().second)
+
+            // 4. Next round also crashes at 1.50x -> doubles again 40.0 -> 80.0 & types 80.00
+            platform.simulateNewRoundResetCancel()
+            engine.handleScreenEvent(mapWithRibbon(14_000L, GamePhase.BETTING_OPEN, listOf(1.50, 1.35, 3.10, 4.20)))
+            assertEquals(80.0, engine.state.value.currentStake, 0.01)
+            assertEquals(2, engine.state.value.consecutiveLosses)
+            assertEquals("80.00", platform.setTextCalls.last().second)
+
+            // 5. Next round wins at 2.40x (>= 2.0x) -> resets to base 20.0
+            platform.simulateNewRoundResetCancel()
+            engine.handleScreenEvent(mapWithRibbon(21_000L, GamePhase.BETTING_OPEN, listOf(2.40, 1.50, 1.35, 3.10)))
+            assertEquals(20.0, engine.state.value.currentStake, 0.01)
+            assertEquals(0, engine.state.value.consecutiveLosses)
+
+            // 6. Verify ADD mode (20.0 + 15.0 = 35.0)
+            repo.saveConfig(repo.getConfig().copy(afterLoss = AfterLossMode.ADD, addAmount = 15.0))
+            engine.syncStakeWithConfig()
+            runCurrent()
+            platform.simulateNewRoundResetCancel()
+            engine.handleScreenEvent(mapWithRibbon(28_000L, GamePhase.BETTING_OPEN, listOf(1.10, 2.40, 1.50, 1.35)))
+            assertEquals(35.0, engine.state.value.currentStake, 0.01)
+            assertEquals("35.00", platform.setTextCalls.last().second)
+
+            // 7. Verify KEEP mode stays at baseStake (20.0) on loss
+            repo.saveConfig(repo.getConfig().copy(afterLoss = AfterLossMode.KEEP))
+            engine.syncStakeWithConfig(resetProgression = true)
+            runCurrent()
+            platform.simulateNewRoundResetCancel()
+            engine.handleScreenEvent(mapWithRibbon(35_000L, GamePhase.BETTING_OPEN, listOf(1.05, 1.10, 2.40, 1.50)))
+            assertEquals(20.0, engine.state.value.currentStake, 0.01)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun `T22 PatternAlertManager and AutomationEngine cancelActiveAlarm silence active alarms immediately`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, BetManagerDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val repo = BetManagerRepository(context, db.betManagerDao())
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val engineScope = CoroutineScope(SupervisorJob() + dispatcher)
+            val engine = AutomationEngine(repo, engineScope)
+            val alertManager = PatternAlertManager(context, repo)
+            engine.attachPatternAlertManager(alertManager)
+            runCurrent()
+
+            alertManager.processPatternProgress(
+                progress = PatternProgress(
+                    ruleName = "Three Consecutive Lows",
+                    matchedCount = 3,
+                    requiredCount = 3,
+                    isMatched = true,
+                    signalStage = PatternSignalStage.HIGH_SIGNAL,
+                    statusText = "PATTERN MET",
+                    triggerSignature = "sig_alarm_test"
+                ),
+                gameSite = "BetPawa"
+            )
+            runCurrent()
+
+            assertTrue(alertManager.isAlarmActiveFlow.value)
+            assertTrue(engine.state.value.isAlarmActive)
+            assertNotNull(engine.state.value.activeAlarmTitle)
+
+            engine.cancelActiveAlarm()
+            runCurrent()
+
+            assertFalse(alertManager.isAlarmActiveFlow.value)
+            assertFalse(engine.state.value.isAlarmActive)
+            assertNull(engine.state.value.activeAlarmTitle)
         } finally {
             db.close()
         }

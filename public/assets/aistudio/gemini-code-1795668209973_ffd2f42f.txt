@@ -1,0 +1,10 @@
+Fix loss recovery tracking, returning to base stake after recovery, and win/loss (W/L) / profit recording in this BetManager Android project while keeping unrelated features intact:
+
+1. **Recovery Deficit & Base-Stake Reset (`StakeCalculator.kt`, `AutomationEngine.kt`, `BetManagerRepository.kt`, `BetManagerViewModel.kt`)**:
+   - Track and persist `recoveryDeficit` (alongside `currentStake` and `consecutiveLosses`) in `BetManagerRepository`, `BetManagerViewModel`, and `EngineUiState`.
+   - In `StakeCalculator.onWin(...)`, do not reset `nextStake` to `baseStake` and `consecutiveLosses = 0` on a single win if `newDeficit > 0.01` and recovery is not yet complete; only return `nextStake` to `baseStake` and clear `consecutiveLosses` once recovered (or when `stopAfterLosses` / explicit reset occurs).
+   - Ensure `syncStakeWithConfig(...)` and `processScreenMap(...)` preserve active recovery state (`recoveryDeficit > 0.01` or `consecutiveLosses > 0`) instead of resetting to `baseStake` prematurely.
+
+2. **Accurate Win/Loss & Profit History (`AutomationEngine.kt`)**:
+   - Only settle a round as a win or loss in `recordCurrentCrashAndSettle(...)` when a BetManager bet was actually confirmed/placed.
+   - Ensure `won`, `profitDelta`, `todayProfit`, `RoundRecord`s, and `Last: W/L` history reflect actual confirmed bet outcomes rather than recording a loss when a bet won (or a win when a bet lost).

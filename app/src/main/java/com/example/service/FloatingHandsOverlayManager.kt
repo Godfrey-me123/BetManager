@@ -12,10 +12,20 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import com.example.data.engine.FloatingHandState
 import com.example.data.local.BetManagerRepository
+import com.example.data.model.AfterLossMode
+import com.example.data.model.BettingMode
+import com.example.data.model.CustomPatternStrategy
 import kotlin.math.abs
+
+enum class OverlayTab {
+    LIVE,
+    STRATEGY,
+    SETTINGS
+}
 
 /** Everything the floating panel & BET hand show. Built by the accessibility service from engine + settings state. */
 data class OverlayInfo(
@@ -40,15 +50,26 @@ data class OverlayInfo(
     val canEditStake: Boolean = true,
     val recordedMultipliers: List<Double> = emptyList(),
     val patternSummary: String = "",
-    val isPatternMatched: Boolean = false
+    val isPatternMatched: Boolean = false,
+    val isAlarmActive: Boolean = false,
+    val activeAlarmTitle: String? = null,
+    val afterLossMode: AfterLossMode = AfterLossMode.DOUBLE,
+    val bettingMode: BettingMode = BettingMode.USE_STRATEGY_RULES,
+    val cashOutTarget: Double = 2.0,
+    val customStrategies: List<CustomPatternStrategy> = emptyList(),
+    val alarmHighSignalEnabled: Boolean = true,
+    val preSignalEnabled: Boolean = true,
+    val alertSoundEnabled: Boolean = true,
+    val alertVibrationEnabled: Boolean = true
 )
 
 /**
  * The BetManager floating overlay system (TYPE_ACCESSIBILITY_OVERLAY, needs no extra permission):
  *  1) Draggable Floating BET Hand: user drags it over the game's Bet button to detect the target
  *     and run the verified edit-stake + real Bet click flow (or taps it / enables Auto Bet).
- *  2) Compact "BM" Bubble / Expanded Panel: shows status, monitored crashes, balance, stake,
- *     BET, Auto Bet ON/OFF, Start / Stop, Stake - / +, Open app, and EXIT (stops app & clears all activities).
+ *  2) Compact "BM" Bubble (turns into 1-tap "STOP ALARM" when ringing) / Tabbed Expanded Panel
+ *     (Live / Strategy / Settings) so the user never has to leave the game to change Martingale,
+ *     strategy rules, alarms, or silence active alarms. Full Screen opens only on explicit tap.
  */
 class FloatingHandsOverlayManager(
     private val context: Context,
@@ -60,7 +81,15 @@ class FloatingHandsOverlayManager(
     private val onStakeStep: (Int) -> Unit,
     private val onOpenApp: () -> Unit,
     private val onExitApp: () -> Unit,
-    private val onToggleKeepScreenAwake: () -> Unit = {}
+    private val onToggleKeepScreenAwake: () -> Unit = {},
+    private val onCancelAlarm: () -> Unit = {},
+    private val onSelectAfterLossMode: (AfterLossMode) -> Unit = {},
+    private val onSelectBettingMode: (BettingMode) -> Unit = {},
+    private val onToggleCustomStrategy: (CustomPatternStrategy, Boolean) -> Unit = { _, _ -> },
+    private val onToggleAlarmHighSignal: () -> Unit = {},
+    private val onTogglePreSignal: () -> Unit = {},
+    private val onToggleAlertSound: () -> Unit = {},
+    private val onToggleAlertVibration: () -> Unit = {}
 ) {
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -71,11 +100,21 @@ class FloatingHandsOverlayManager(
     private var panelView: LinearLayout? = null
     private var betHandView: TextView? = null
     private var expanded = false
+    private var activeTab = OverlayTab.LIVE
     private var lastInfo = OverlayInfo()
     private var lastTapAtMs = 0L
     private var wasRunning = false
 
     // panel widgets
+    private var stopAlarmBannerBtn: TextView? = null
+    private var tabLiveBtn: TextView? = null
+    private var tabStrategyBtn: TextView? = null
+    private var tabSettingsBtn: TextView? = null
+    private var liveContainer: LinearLayout? = null
+    private var strategyContainer: LinearLayout? = null
+    private var settingsContainer: LinearLayout? = null
+
+    // Live tab widgets
     private var statusText: TextView? = null
     private var patternText: TextView? = null
     private var multipliersContainer: LinearLayout? = null
@@ -91,6 +130,24 @@ class FloatingHandsOverlayManager(
     private var startStopButton: TextView? = null
     private var stakeMinus: TextView? = null
     private var stakePlus: TextView? = null
+
+    // Strategy tab widgets
+    private var modeRulesBtn: TextView? = null
+    private var modeEveryRoundBtn: TextView? = null
+    private var rulesListLayout: LinearLayout? = null
+    private var lastRenderedRulesKey: String = ""
+
+    // Settings tab widgets
+    private var lossDoubleBtn: TextView? = null
+    private var lossAddBtn: TextView? = null
+    private var lossKeepBtn: TextView? = null
+    private var settingsStakeSummary: TextView? = null
+    private var settingsStakeMinus: TextView? = null
+    private var settingsStakePlus: TextView? = null
+    private var alarmHighSignalBtn: TextView? = null
+    private var preSignalBtn: TextView? = null
+    private var alertSoundBtn: TextView? = null
+    private var alertVibrateBtn: TextView? = null
 
     private val layoutParams = WindowManager.LayoutParams(
         WindowManager.LayoutParams.WRAP_CONTENT,
@@ -152,10 +209,6 @@ class FloatingHandsOverlayManager(
         applyInfo(lastInfo)
     }
 
-    /**
-     * Temporarily makes all floating overlays touch-transparent (FLAG_NOT_TOUCHABLE)
-     * so Accessibility dispatchGesture clicks pass directly through the BET hand onto the game's Bet button.
-     */
     fun setPassThrough(isPassThrough: Boolean) {
         val applyAction = Runnable {
             applyPassThroughToView(betHandView, betHandLayoutParams, isPassThrough)
@@ -178,7 +231,7 @@ class FloatingHandsOverlayManager(
         val startedNow = info.isRunning && !wasRunning
         wasRunning = info.isRunning
         lastInfo = info
-        if (expanded && (startedNow || info.handState == FloatingHandState.READY && info.isRunning)) {
+        if (expanded && startedNow && activeTab == OverlayTab.LIVE && !info.isAlarmActive) {
             setExpanded(false)
             return
         }
@@ -248,12 +301,12 @@ class FloatingHandsOverlayManager(
         TextView(context).apply {
             text = label
             setTextColor(textColor)
-            textSize = 13f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            minHeight = dp(44)
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            background = flat(fill, stroke, 12)
+            minHeight = dp(40)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = flat(fill, stroke, 10)
             setOnClickListener { onClick() }
         }
 
@@ -266,7 +319,7 @@ class FloatingHandsOverlayManager(
         }
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun menuDragListener(target: View): View.OnTouchListener {
+    private fun menuDragListener(target: View, isBubble: Boolean): View.OnTouchListener {
         var startX = 0
         var startY = 0
         var downX = 0f
@@ -295,6 +348,8 @@ class FloatingHandsOverlayManager(
                 MotionEvent.ACTION_UP -> {
                     if (dragging) {
                         repository.saveOverlayPosition(layoutParams.x, layoutParams.y)
+                    } else if (isBubble && lastInfo.isAlarmActive) {
+                        onCancelAlarm()
                     } else {
                         setExpanded(!expanded)
                     }
@@ -380,12 +435,12 @@ class FloatingHandsOverlayManager(
     private fun addBubble() {
         val bubble = TextView(context).apply {
             text = "BM"
-            textSize = 14f
+            textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(C_INK)
             gravity = Gravity.CENTER
-            minWidth = dp(52)
-            minHeight = dp(52)
+            minWidth = dp(54)
+            minHeight = dp(54)
             contentDescription = "BetManager overlay menu"
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -393,7 +448,7 @@ class FloatingHandsOverlayManager(
                 setStroke(dp(3), C_AMBER)
             }
         }
-        bubble.setOnTouchListener(menuDragListener(bubble))
+        bubble.setOnTouchListener(menuDragListener(bubble, isBubble = true))
         runCatching { wm.addView(bubble, layoutParams) }
         bubbleView = bubble
     }
@@ -404,9 +459,10 @@ class FloatingHandsOverlayManager(
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(12))
             background = flat(C_PANEL, C_BORDER, 18)
-            minimumWidth = dp(292)
+            minimumWidth = dp(304)
         }
 
+        // Top drag header
         val header = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -415,29 +471,70 @@ class FloatingHandsOverlayManager(
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         val collapse = button("Hide", C_SOFT, C_INK, C_BORDER) { setExpanded(false) }.apply {
-            minHeight = dp(36)
-            textSize = 12f
+            minHeight = dp(34)
+            textSize = 11f
         }
         header.addView(title)
         header.addView(collapse)
-        header.setOnTouchListener(menuDragListener(panel))
-        title.setOnTouchListener(menuDragListener(panel))
+        header.setOnTouchListener(menuDragListener(panel, isBubble = false))
+        title.setOnTouchListener(menuDragListener(panel, isBubble = false))
         panel.addView(header)
 
-        statusText = label("Ready", 13f, C_INK).apply { setPadding(0, dp(8), 0, dp(2)); maxLines = 2 }
+        // Urgent STOP ALARM button directly on overlay main screen (shown when alarm is ringing)
+        stopAlarmBannerBtn = button("🔔 STOP ALARM NOW", C_RED_DARK, 0xFFFFFFFF.toInt(), C_RED_DARK) {
+            onCancelAlarm()
+        }.apply {
+            textSize = 13f
+            minHeight = dp(44)
+            contentDescription = "Cancel and silence active alarm"
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(8)
+            }
+        }
+        panel.addView(stopAlarmBannerBtn)
+
+        // Tab switcher strip: Live | Strategy | Settings
+        val tabRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, dp(6))
+        }
+        tabLiveBtn = button("Live", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            activeTab = OverlayTab.LIVE
+            applyTabVisibility()
+        }
+        tabStrategyBtn = button("Strategy", C_SOFT, C_INK, C_BORDER) {
+            activeTab = OverlayTab.STRATEGY
+            applyTabVisibility()
+        }
+        tabSettingsBtn = button("Settings", C_SOFT, C_INK, C_BORDER) {
+            activeTab = OverlayTab.SETTINGS
+            applyTabVisibility()
+        }
+        tabRow.addView(tabLiveBtn, weightParams(end = 3))
+        tabRow.addView(tabStrategyBtn, weightParams(start = 3, end = 3))
+        tabRow.addView(tabSettingsBtn, weightParams(start = 3))
+        panel.addView(tabRow)
+
+        // ------------------ LIVE TAB ------------------
+        val liveTab = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        statusText = label("Ready", 13f, C_INK).apply { setPadding(0, dp(4), 0, dp(2)); maxLines = 2 }
         patternText = label("Pattern: Idle", 12f, C_INK, bold = true).apply { setPadding(0, dp(2), 0, dp(2)); maxLines = 2 }
         multipliersContainer = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, dp(2), 0, dp(4))
         }
-        gameText = label("", 12f, C_INK_SOFT)
+        gameText = label("", 11f, C_INK_SOFT)
         crashText = label("Crash --   Tracked: 0", 12f, C_INK, bold = true)
         balanceText = label("Balance --", 12f, C_INK_SOFT)
         stakeText = label("Stake --", 13f, C_INK, bold = true).apply { setPadding(0, dp(4), 0, 0) }
-        liveText = label("", 12f, C_INK_SOFT)
-        resultsText = label("", 13f, C_INK).apply { setPadding(0, dp(4), 0, dp(8)) }
+        liveText = label("", 11f, C_INK_SOFT)
+        resultsText = label("", 12f, C_INK).apply { setPadding(0, dp(2), 0, dp(8)) }
         listOf(statusText, patternText, multipliersContainer, gameText, crashText, balanceText, stakeText, liveText, resultsText).forEach {
-            panel.addView(it)
+            liveTab.addView(it)
         }
 
         val row1 = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
@@ -449,40 +546,185 @@ class FloatingHandsOverlayManager(
         }
         row1.addView(betButton, weightParams(end = 4))
         row1.addView(autoBetButton, weightParams(start = 4))
-        panel.addView(row1)
+        liveTab.addView(row1)
 
         val row2 = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(6), 0, 0)
         }
         startStopButton = button("Start", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) { onToggleStartStop() }
         stakeMinus = button("-", C_SOFT, C_INK, C_BORDER) { onStakeStep(-1) }
         stakePlus = button("+", C_SOFT, C_INK, C_BORDER) { onStakeStep(1) }
         row2.addView(startStopButton, weightParams(end = 4))
-        row2.addView(stakeMinus, LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(4) })
-        row2.addView(stakePlus, LinearLayout.LayoutParams(dp(48), LinearLayout.LayoutParams.WRAP_CONTENT))
-        panel.addView(row2)
+        row2.addView(stakeMinus, LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(4) })
+        row2.addView(stakePlus, LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT))
+        liveTab.addView(row2)
 
         val row3 = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(8), 0, 0)
+            setPadding(0, dp(6), 0, 0)
         }
         keepAwakeButton = button("Awake: OFF", C_SOFT, C_INK, C_BORDER) {
             onToggleKeepScreenAwake()
         }.apply {
             contentDescription = "Toggle never sleep keep screen on"
         }
-        val open = button("Open", C_SOFT, C_INK, C_BORDER) { onOpenApp() }
+        val fullScreenBtn = button("Full Screen", C_SOFT, C_INK, C_BORDER) { onOpenApp() }.apply {
+            contentDescription = "Open full screen BetManager app"
+        }
         val exitBtn = button("EXIT", C_RED_SOFT, C_RED_DARK, C_RED_DARK) { onExitApp() }.apply {
             contentDescription = "Exit BetManager and clear all activities"
         }
         row3.addView(keepAwakeButton, weightParams(end = 3))
-        row3.addView(open, weightParams(start = 3, end = 3))
+        row3.addView(fullScreenBtn, weightParams(start = 3, end = 3))
         row3.addView(exitBtn, weightParams(start = 3))
-        panel.addView(row3)
+        liveTab.addView(row3)
+
+        liveContainer = liveTab
+        panel.addView(liveTab)
+
+        // ------------------ STRATEGY TAB ------------------
+        val stratTab = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        stratTab.addView(label("BETTING MODE", 11f, C_INK_SOFT, bold = true).apply {
+            setPadding(0, dp(4), 0, dp(4))
+        })
+        val modeRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        modeRulesBtn = button("Use Rules", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onSelectBettingMode(BettingMode.USE_STRATEGY_RULES)
+        }
+        modeEveryRoundBtn = button("Every Round", C_SOFT, C_INK, C_BORDER) {
+            onSelectBettingMode(BettingMode.BET_EVERY_ROUND)
+        }
+        modeRow.addView(modeRulesBtn, weightParams(end = 4))
+        modeRow.addView(modeEveryRoundBtn, weightParams(start = 4))
+        stratTab.addView(modeRow)
+
+        stratTab.addView(label("USER STRATEGIES (TAP TO TOGGLE)", 11f, C_INK_SOFT, bold = true).apply {
+            setPadding(0, dp(10), 0, dp(4))
+        })
+        val rulesList = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        val rulesScroll = ScrollView(context).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(180)
+            )
+            addView(rulesList)
+        }
+        rulesListLayout = rulesList
+        stratTab.addView(rulesScroll)
+
+        strategyContainer = stratTab
+        panel.addView(stratTab)
+
+        // ------------------ SETTINGS TAB ------------------
+        val setTab = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        setTab.addView(label("AFTER A LOSS (MARTINGALE)", 11f, C_INK_SOFT, bold = true).apply {
+            setPadding(0, dp(4), 0, dp(4))
+        })
+        val lossRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        lossDoubleBtn = button("Double (2x)", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onSelectAfterLossMode(AfterLossMode.DOUBLE)
+        }
+        lossAddBtn = button("Add (+)", C_SOFT, C_INK, C_BORDER) {
+            onSelectAfterLossMode(AfterLossMode.ADD)
+        }
+        lossKeepBtn = button("Keep (None)", C_SOFT, C_INK, C_BORDER) {
+            onSelectAfterLossMode(AfterLossMode.KEEP)
+        }
+        lossRow.addView(lossDoubleBtn, weightParams(end = 3))
+        lossRow.addView(lossAddBtn, weightParams(start = 3, end = 3))
+        lossRow.addView(lossKeepBtn, weightParams(start = 3))
+        setTab.addView(lossRow)
+
+        setTab.addView(label("BASE STAKE", 11f, C_INK_SOFT, bold = true).apply {
+            setPadding(0, dp(10), 0, dp(4))
+        })
+        val stakeRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        settingsStakeSummary = label("--", 13f, C_INK, bold = true).apply {
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        settingsStakeMinus = button("-", C_SOFT, C_INK, C_BORDER) { onStakeStep(-1) }
+        settingsStakePlus = button("+", C_SOFT, C_INK, C_BORDER) { onStakeStep(1) }
+        stakeRow.addView(settingsStakeSummary)
+        stakeRow.addView(settingsStakeMinus, LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(4) })
+        stakeRow.addView(settingsStakePlus, LinearLayout.LayoutParams(dp(44), LinearLayout.LayoutParams.WRAP_CONTENT))
+        setTab.addView(stakeRow)
+
+        setTab.addView(label("PATTERN ALARMS & NOTIFICATIONS", 11f, C_INK_SOFT, bold = true).apply {
+            setPadding(0, dp(10), 0, dp(4))
+        })
+        val alertRow1 = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+        alarmHighSignalBtn = button("Alarm: ON", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onToggleAlarmHighSignal()
+        }
+        preSignalBtn = button("Pre-Sig: ON", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onTogglePreSignal()
+        }
+        alertRow1.addView(alarmHighSignalBtn, weightParams(end = 4))
+        alertRow1.addView(preSignalBtn, weightParams(start = 4))
+        setTab.addView(alertRow1)
+
+        val alertRow2 = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(6), 0, 0)
+        }
+        alertSoundBtn = button("Sound: ON", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onToggleAlertSound()
+        }
+        alertVibrateBtn = button("Vibrate: ON", C_GREEN_SOFT, C_GREEN_DARK, C_GREEN_DARK) {
+            onToggleAlertVibration()
+        }
+        alertRow2.addView(alertSoundBtn, weightParams(end = 4))
+        alertRow2.addView(alertVibrateBtn, weightParams(start = 4))
+        setTab.addView(alertRow2)
+
+        val fullFromSettings = button("Open Full Screen Settings", C_SOFT, C_INK, C_BORDER) {
+            onOpenApp()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        setTab.addView(fullFromSettings)
+
+        settingsContainer = setTab
+        panel.addView(setTab)
 
         runCatching { wm.addView(panel, layoutParams) }
         panelView = panel
+        lastRenderedRulesKey = ""
+        applyTabVisibility()
+    }
+
+    private fun applyTabVisibility() {
+        liveContainer?.visibility = if (activeTab == OverlayTab.LIVE) View.VISIBLE else View.GONE
+        strategyContainer?.visibility = if (activeTab == OverlayTab.STRATEGY) View.VISIBLE else View.GONE
+        settingsContainer?.visibility = if (activeTab == OverlayTab.SETTINGS) View.VISIBLE else View.GONE
+
+        stylePillButton(tabLiveBtn, activeTab == OverlayTab.LIVE)
+        stylePillButton(tabStrategyBtn, activeTab == OverlayTab.STRATEGY)
+        stylePillButton(tabSettingsBtn, activeTab == OverlayTab.SETTINGS)
+    }
+
+    private fun stylePillButton(btn: TextView?, active: Boolean) {
+        btn ?: return
+        if (active) {
+            btn.setTextColor(C_GREEN_DARK)
+            btn.background = flat(C_GREEN_SOFT, C_GREEN_DARK, 10)
+        } else {
+            btn.setTextColor(C_INK)
+            btn.background = flat(C_SOFT, C_BORDER, 10)
+        }
     }
 
     private fun weightParams(start: Int = 0, end: Int = 0) =
@@ -506,10 +748,18 @@ class FloatingHandsOverlayManager(
         panelView?.let { runCatching { wm.removeView(it) } }
         bubbleView = null
         panelView = null
+        stopAlarmBannerBtn = null
+        tabLiveBtn = null; tabStrategyBtn = null; tabSettingsBtn = null
+        liveContainer = null; strategyContainer = null; settingsContainer = null
         statusText = null; patternText = null; multipliersContainer = null
         gameText = null; crashText = null; balanceText = null; stakeText = null
         liveText = null; resultsText = null; betButton = null; autoBetButton = null
         keepAwakeButton = null; startStopButton = null; stakeMinus = null; stakePlus = null
+        modeRulesBtn = null; modeEveryRoundBtn = null; rulesListLayout = null
+        lossDoubleBtn = null; lossAddBtn = null; lossKeepBtn = null
+        settingsStakeSummary = null; settingsStakeMinus = null; settingsStakePlus = null
+        alarmHighSignalBtn = null; preSignalBtn = null; alertSoundBtn = null; alertVibrateBtn = null
+        lastRenderedRulesKey = ""
     }
 
     private fun removeBetHand() {
@@ -522,7 +772,28 @@ class FloatingHandsOverlayManager(
     @SuppressLint("SetTextI18n")
     private fun applyInfo(info: OverlayInfo) {
         applyKeepScreenAwakeFlag(info.keepScreenAwake)
-        (bubbleView?.background as? GradientDrawable)?.setStroke(dp(3), stateColor(info.handState))
+
+        bubbleView?.apply {
+            if (info.isAlarmActive) {
+                text = "STOP\nALARM"
+                textSize = 10f
+                setTextColor(0xFFFFFFFF.toInt())
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(C_RED_DARK)
+                    setStroke(dp(3), C_RED_SOFT)
+                }
+            } else {
+                text = "BM"
+                textSize = 14f
+                setTextColor(C_INK)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(C_PANEL)
+                    setStroke(dp(3), stateColor(info.handState))
+                }
+            }
+        }
 
         betHandView?.apply {
             val (fill, stroke, textCol) = when {
@@ -550,6 +821,17 @@ class FloatingHandsOverlayManager(
         }
 
         if (panelView == null) return
+
+        stopAlarmBannerBtn?.apply {
+            visibility = if (info.isAlarmActive) View.VISIBLE else View.GONE
+            text = if (!info.activeAlarmTitle.isNullOrBlank()) {
+                "🔇 STOP ALARM"
+            } else {
+                "🔔 STOP ALARM NOW"
+            }
+        }
+
+        // Live Tab
         statusText?.text = info.statusLine
         patternText?.apply {
             text = if (info.patternSummary.isNotBlank()) info.patternSummary else "Pattern: Waiting for data"
@@ -559,8 +841,7 @@ class FloatingHandsOverlayManager(
             removeAllViews()
             val recent = info.recordedMultipliers.take(5)
             if (recent.isEmpty()) {
-                val emptyLabel = label("No recorded crashes", 11f, C_INK_SOFT)
-                addView(emptyLabel)
+                addView(label("No recorded crashes", 11f, C_INK_SOFT))
             } else {
                 recent.forEach { mult ->
                     val (fill, stroke, textCol) = when {
@@ -585,11 +866,17 @@ class FloatingHandsOverlayManager(
                 }
             }
         }
+        val lossModeLabel = when (info.afterLossMode) {
+            AfterLossMode.DOUBLE -> "Double"
+            AfterLossMode.ADD -> "Add"
+            AfterLossMode.KEEP -> "Keep"
+        }
         gameText?.text = info.gameLine
         crashText?.text = "Crash ${info.latestCrashText}   Tracked: ${info.monitoredCrashes}"
         balanceText?.text = "Balance ${info.balanceText}" +
             if (info.todayProfitText.isNotBlank()) "   Today ${info.todayProfitText}" else ""
-        stakeText?.text = "Stake ${info.stakeText}" + if (info.lossStreak > 0) "   Losses in a row: ${info.lossStreak}" else ""
+        stakeText?.text = "Stake ${info.stakeText} · $lossModeLabel · Win>=${"%.2fx".format(info.cashOutTarget)}" +
+            if (info.lossStreak > 0) " (${info.lossStreak}L)" else ""
         liveText?.text = listOf(info.phaseText, info.multiplierText).filter { it.isNotBlank() }.joinToString("   ")
         resultsText?.text = if (info.lastResults.isEmpty()) "No bets yet"
         else "Last: " + info.lastResults.joinToString(" ") { if (it) "W" else "L" }
@@ -604,40 +891,116 @@ class FloatingHandsOverlayManager(
             isEnabled = info.handState != FloatingHandState.LOCKED
         }
         autoBetButton?.apply {
-            if (info.handAutoBetEnabled) {
-                text = "Auto: ON"
-                setTextColor(C_GREEN_DARK)
-                background = flat(C_GREEN_SOFT, C_GREEN_DARK, 12)
-            } else {
-                text = "Auto: OFF"
-                setTextColor(C_INK)
-                background = flat(C_SOFT, C_BORDER, 12)
-            }
+            text = if (info.handAutoBetEnabled) "Auto: ON" else "Auto: OFF"
+            stylePillButton(this, info.handAutoBetEnabled)
         }
         keepAwakeButton?.apply {
-            if (info.keepScreenAwake) {
-                text = "Awake: ON"
-                setTextColor(C_GREEN_DARK)
-                background = flat(C_GREEN_SOFT, C_GREEN_DARK, 12)
-            } else {
-                text = "Awake: OFF"
-                setTextColor(C_INK)
-                background = flat(C_SOFT, C_BORDER, 12)
-            }
+            text = if (info.keepScreenAwake) "Awake: ON" else "Awake: OFF"
+            stylePillButton(this, info.keepScreenAwake)
         }
         startStopButton?.apply {
             if (info.isRunning) {
                 text = "Stop"
                 setTextColor(C_RED_DARK)
-                background = flat(C_RED_SOFT, C_RED_DARK, 12)
+                background = flat(C_RED_SOFT, C_RED_DARK, 10)
             } else {
                 text = "Start"
                 setTextColor(C_GREEN_DARK)
-                background = flat(C_GREEN_SOFT, C_GREEN_DARK, 12)
+                background = flat(C_GREEN_SOFT, C_GREEN_DARK, 10)
             }
         }
         val canEdit = info.canEditStake && !info.isRunning
-        listOf(stakeMinus, stakePlus).forEach { it?.alpha = if (canEdit) 1f else 0.4f; it?.isEnabled = canEdit }
+        listOf(stakeMinus, stakePlus, settingsStakeMinus, settingsStakePlus).forEach {
+            it?.alpha = if (canEdit) 1f else 0.4f
+            it?.isEnabled = canEdit
+        }
+
+        // Strategy Tab
+        stylePillButton(modeRulesBtn, info.bettingMode == BettingMode.USE_STRATEGY_RULES)
+        stylePillButton(modeEveryRoundBtn, info.bettingMode == BettingMode.BET_EVERY_ROUND)
+
+        val strategiesKey = info.customStrategies.joinToString("|") {
+            "${it.id}:${it.name}:${it.isEnabled}:${it.currentlyReached}:${it.summaryDescription()}"
+        }
+        if (strategiesKey != lastRenderedRulesKey) {
+            lastRenderedRulesKey = strategiesKey
+            rulesListLayout?.apply {
+                removeAllViews()
+                if (info.customStrategies.isEmpty()) {
+                    addView(
+                        label(
+                            "No strategies configured. Open Full Screen → Strategy to add one.",
+                            12f,
+                            C_INK_SOFT
+                        ).apply { setPadding(0, dp(6), 0, dp(6)) }
+                    )
+                } else {
+                    info.customStrategies.forEach { strategy ->
+                        val row = LinearLayout(context).apply {
+                            orientation = LinearLayout.HORIZONTAL
+                            gravity = Gravity.CENTER_VERTICAL
+                            background = flat(
+                                if (strategy.isEnabled) C_GREEN_SOFT else C_SOFT,
+                                if (strategy.isEnabled) C_GREEN_DARK else C_BORDER,
+                                10
+                            )
+                            setPadding(dp(8), dp(6), dp(8), dp(6))
+                            layoutParams = LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT
+                            ).apply { bottomMargin = dp(6) }
+                            setOnClickListener { onToggleCustomStrategy(strategy, !strategy.isEnabled) }
+                        }
+                        val col = LinearLayout(context).apply {
+                            orientation = LinearLayout.VERTICAL
+                            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        }
+                        col.addView(label(strategy.name, 12f, C_INK, bold = true))
+                        val desc = strategy.summaryDescription()
+                        if (desc.isNotBlank()) {
+                            col.addView(label(desc, 10f, C_INK_SOFT))
+                        }
+                        val pillText = when {
+                            strategy.isEnabled && strategy.currentlyReached -> "READY"
+                            strategy.isEnabled -> "ON"
+                            else -> "OFF"
+                        }
+                        val pill = label(
+                            pillText,
+                            11f,
+                            if (strategy.isEnabled) C_GREEN_DARK else C_INK_SOFT,
+                            bold = true
+                        )
+                        row.addView(col)
+                        row.addView(pill)
+                        addView(row)
+                    }
+                }
+            }
+        }
+
+        // Settings Tab
+        stylePillButton(lossDoubleBtn, info.afterLossMode == AfterLossMode.DOUBLE)
+        stylePillButton(lossAddBtn, info.afterLossMode == AfterLossMode.ADD)
+        stylePillButton(lossKeepBtn, info.afterLossMode == AfterLossMode.KEEP)
+        settingsStakeSummary?.text = "${info.stakeText} · Win >= ${"%.2fx".format(info.cashOutTarget)}"
+
+        alarmHighSignalBtn?.apply {
+            text = if (info.alarmHighSignalEnabled) "Alarm: ON" else "Alarm: OFF"
+            stylePillButton(this, info.alarmHighSignalEnabled)
+        }
+        preSignalBtn?.apply {
+            text = if (info.preSignalEnabled) "Pre-Sig: ON" else "Pre-Sig: OFF"
+            stylePillButton(this, info.preSignalEnabled)
+        }
+        alertSoundBtn?.apply {
+            text = if (info.alertSoundEnabled) "Sound: ON" else "Sound: OFF"
+            stylePillButton(this, info.alertSoundEnabled)
+        }
+        alertVibrateBtn?.apply {
+            text = if (info.alertVibrationEnabled) "Vibrate: ON" else "Vibrate: OFF"
+            stylePillButton(this, info.alertVibrationEnabled)
+        }
     }
 
     private companion object {

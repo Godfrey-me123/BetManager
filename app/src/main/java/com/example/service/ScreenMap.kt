@@ -108,6 +108,7 @@ data class ScreenMap(
     val liveMultiplier: Double? = null,
     val lastCrashMultiplier: Double? = null,
     val ribbonMultipliers: List<Double> = emptyList(),
+    val ribbonChipColors: List<String> = emptyList(),
     val betButton: UiTarget? = null,
     val cancelButton: UiTarget? = null,
     val stakeField: UiTarget? = null,
@@ -118,6 +119,10 @@ data class ScreenMap(
     val panelCount: Int = 0,
     val usingHandIndex: Int = 1,
     val hasImeWindow: Boolean = false,
+    val autoCashOutState: SwitchState = SwitchState.UNREADABLE,
+    val autoCashOutTarget: Double? = null,
+    val cashedOutMultiplier: Double? = null,
+    val winBannerAmount: Double? = null,
     val conflictReason: String? = null
 ) {
     val gameWindowFound: Boolean

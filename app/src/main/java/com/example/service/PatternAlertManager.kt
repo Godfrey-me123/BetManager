@@ -2,12 +2,15 @@ package com.example.service
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
 import android.media.AudioAttributes
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.Build
-import android.os.CombinedVibration
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -16,6 +19,9 @@ import com.example.R
 import com.example.data.engine.PatternProgress
 import com.example.data.engine.PatternSignalStage
 import com.example.data.local.BetManagerRepository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class PatternAlertManager(
     private val context: Context,
@@ -32,11 +38,23 @@ class PatternAlertManager(
         context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var activeRingtone: Ringtone? = null
     private var lastDispatchedSignature: String? = null
     private var lastDispatchedStage: PatternSignalStage = PatternSignalStage.NONE
 
+    private val _isAlarmActiveFlow = MutableStateFlow(false)
+    val isAlarmActiveFlow: StateFlow<Boolean> = _isAlarmActiveFlow.asStateFlow()
+
+    private val _activeAlarmTitleFlow = MutableStateFlow<String?>(null)
+    val activeAlarmTitleFlow: StateFlow<String?> = _activeAlarmTitleFlow.asStateFlow()
+
+    private val autoSilenceRunnable = Runnable {
+        stopSoundAndVibrationOnly()
+    }
+
     init {
+        activeInstance = this
         createNotificationChannels()
     }
 
@@ -100,7 +118,17 @@ class PatternAlertManager(
     private fun dispatchHighSignalAlarm(progress: PatternProgress, gameSite: String) {
         if (!repository.isAlarmHighSignalEnabled()) return
 
-        // Sound alert
+        val title = "🔔 TIME TO BET! ${progress.ruleName}"
+        val content = if (gameSite.isNotBlank()) {
+            "Pattern MET on $gameSite: ${progress.statusText}. Tap Stop Alarm when ready."
+        } else {
+            "Pattern MET: ${progress.statusText}. Tap Stop Alarm when ready."
+        }
+
+        _isAlarmActiveFlow.value = true
+        _activeAlarmTitleFlow.value = title
+
+        // Sound alert with safety timeout so alarm never rings endlessly
         if (repository.isAlertSoundEnabled()) {
             playAlertSound(isUrgent = true)
         }
@@ -110,37 +138,30 @@ class PatternAlertManager(
             vibratePattern(longArrayOf(0, 350, 150, 350, 150, 500))
         }
 
-        // High priority notification
-        val title = "🔔 TIME TO BET! ${progress.ruleName}"
-        val content = if (gameSite.isNotBlank()) {
-            "Pattern MET on $gameSite: ${progress.statusText}. Bet immediately!"
-        } else {
-            "Pattern MET: ${progress.statusText}. Bet immediately!"
-        }
+        mainHandler.removeCallbacks(autoSilenceRunnable)
+        mainHandler.postDelayed(autoSilenceRunnable, ALARM_MAX_RING_MS)
 
         showNotification(
             id = NOTIFICATION_ID_ALARM,
             channelId = CHANNEL_ALARM,
             title = title,
             content = content,
-            priority = NotificationCompat.PRIORITY_MAX
+            priority = NotificationCompat.PRIORITY_MAX,
+            isHighSignal = true
         )
     }
 
     private fun dispatchPreSignalWarning(progress: PatternProgress, gameSite: String) {
         if (!repository.isPreSignalNotificationEnabled()) return
 
-        // Sound alert
         if (repository.isAlertSoundEnabled()) {
             playAlertSound(isUrgent = false)
         }
 
-        // Vibration alert
         if (repository.isAlertVibrationEnabled()) {
             vibratePattern(longArrayOf(0, 200, 100, 200))
         }
 
-        // Pre-signal notification
         val title = "⚠️ Pre-Signal: 1 Crash Away! (${progress.ruleName})"
         val content = if (gameSite.isNotBlank()) {
             "Approaching on $gameSite: ${progress.statusText}. Prepare next round bet!"
@@ -153,7 +174,8 @@ class PatternAlertManager(
             channelId = CHANNEL_PRESIGNAL,
             title = title,
             content = content,
-            priority = NotificationCompat.PRIORITY_HIGH
+            priority = NotificationCompat.PRIORITY_HIGH,
+            isHighSignal = false
         )
     }
 
@@ -174,6 +196,10 @@ class PatternAlertManager(
                             .setUsage(if (isUrgent) AudioAttributes.USAGE_ALARM else AudioAttributes.USAGE_NOTIFICATION_EVENT)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        // Do not loop infinitely if system lets us disable looping
+                        isLooping = isUrgent
                     }
                     play()
                 }
@@ -201,9 +227,30 @@ class PatternAlertManager(
         channelId: String,
         title: String,
         content: String,
-        priority: Int
+        priority: Int,
+        isHighSignal: Boolean
     ) {
         try {
+            val stopIntent = Intent(context, AlarmActionReceiver::class.java).apply {
+                action = AlarmActionReceiver.ACTION_STOP_ALARM
+            }
+            val stopPendingIntent = PendingIntent.getBroadcast(
+                context,
+                REQUEST_CODE_STOP_ALARM,
+                stopIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val openOverlayIntent = Intent(context, AlarmActionReceiver::class.java).apply {
+                action = AlarmActionReceiver.ACTION_OPEN_OVERLAY
+            }
+            val openOverlayPendingIntent = PendingIntent.getBroadcast(
+                context,
+                REQUEST_CODE_OPEN_OVERLAY,
+                openOverlayIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
             val builder = NotificationCompat.Builder(context, channelId)
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
                 .setContentTitle(title)
@@ -211,6 +258,18 @@ class PatternAlertManager(
                 .setStyle(NotificationCompat.BigTextStyle().bigText(content))
                 .setPriority(priority)
                 .setAutoCancel(true)
+                .setContentIntent(openOverlayPendingIntent)
+                .setDeleteIntent(stopPendingIntent)
+                .addAction(
+                    android.R.drawable.ic_media_pause,
+                    if (isHighSignal) "STOP ALARM" else "Dismiss",
+                    stopPendingIntent
+                )
+
+            if (isHighSignal) {
+                builder.setCategory(NotificationCompat.CATEGORY_ALARM)
+                builder.setOngoing(false)
+            }
 
             notificationManager?.notify(id, builder.build())
         } catch (_: Exception) {}
@@ -223,9 +282,25 @@ class PatternAlertManager(
         } catch (_: Exception) {}
     }
 
+    private fun stopSoundAndVibrationOnly() {
+        mainHandler.removeCallbacks(autoSilenceRunnable)
+        stopSound()
+        runCatching { vibrator?.cancel() }
+        _isAlarmActiveFlow.value = false
+        _activeAlarmTitleFlow.value = null
+    }
+
+    fun cancelAlarm() {
+        stopSoundAndVibrationOnly()
+        clearNotificationsOnly()
+    }
+
     fun clearNotifications() {
+        cancelAlarm()
+    }
+
+    private fun clearNotificationsOnly() {
         try {
-            stopSound()
             notificationManager?.cancel(NOTIFICATION_ID_ALARM)
             notificationManager?.cancel(NOTIFICATION_ID_PRESIGNAL)
         } catch (_: Exception) {}
@@ -236,5 +311,21 @@ class PatternAlertManager(
         const val CHANNEL_PRESIGNAL = "bet_manager_presignal_channel"
         private const val NOTIFICATION_ID_ALARM = 9001
         private const val NOTIFICATION_ID_PRESIGNAL = 9002
+        private const val REQUEST_CODE_STOP_ALARM = 9101
+        private const val REQUEST_CODE_OPEN_OVERLAY = 9102
+        private const val ALARM_MAX_RING_MS = 12_000L
+
+        @Volatile
+        var activeInstance: PatternAlertManager? = null
+            private set
+
+        fun cancelActiveAlarm(context: Context) {
+            activeInstance?.cancelAlarm()
+            runCatching {
+                val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                nm?.cancel(NOTIFICATION_ID_ALARM)
+                nm?.cancel(NOTIFICATION_ID_PRESIGNAL)
+            }
+        }
     }
 }

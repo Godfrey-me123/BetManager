@@ -49,4 +49,11 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("start_stop_button").assertIsDisplayed()
         composeRule.onNodeWithTag("home_status_line").assertIsDisplayed()
     }
+
+    @Test
+    fun `main activity launches without crashing`() {
+        val controller = org.robolectric.Robolectric.buildActivity(MainActivity::class.java).setup()
+        composeRule.waitForIdle()
+        controller.destroy()
+    }
 }

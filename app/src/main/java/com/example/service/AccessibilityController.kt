@@ -171,15 +171,28 @@ object AccessibilityController {
         }
 
         val cancelButton = panelNodes.firstOrNull { isCancelButton(it.target) }?.target
-        val autoTabButton = panelNodes.firstOrNull { isTabButton(it.target, "auto") }?.target
-        val betTabButton = panelNodes.firstOrNull { isTabButton(it.target, "bet") }?.target
+        val autoTabButton = panelNodes.firstOrNull { isTabButton(it.target, "auto", panelNodes) }?.target
+        val betTabButton = panelNodes.firstOrNull { isTabButton(it.target, "bet", panelNodes) }?.target
 
         val minusStepper = panelNodes.firstOrNull { isStakeStepperMinus(it.target) }?.target
         val plusStepper = panelNodes.firstOrNull { isStakeStepperPlus(it.target) }?.target
 
+        val autoCashLabelBounds = panelNodes.firstOrNull { node ->
+            val t = node.target.primaryText().lowercase()
+            val id = node.target.viewId.lowercase()
+            (t.contains("auto cash") || t.contains("autocash") ||
+                id.contains("auto_cash") || id.contains("autocash")) &&
+                !t.contains("auto bet")
+        }?.target?.bounds
+
         val editableFields = panelNodes
             .map { it.target }
-            .filter { it.isEditable || isNumericInputLike(it) }
+            .filter { candidate ->
+                val onAutoCashRow = autoCashLabelBounds != null &&
+                    abs(candidate.bounds.centerY - autoCashLabelBounds.centerY) <= 60f &&
+                    (minusStepper == null || candidate.bounds.verticalOverlap(minusStepper.bounds) == 0)
+                !onAutoCashRow && isNumericFieldCandidate(candidate, minusStepper, plusStepper)
+            }
 
         val stakeField = selectStakeField(
             editableFields = editableFields,
@@ -191,12 +204,18 @@ object AccessibilityController {
         val siteUrl = detectSiteUrl(visibleNodes)
         val gameName = detectGameName(visibleNodes)
         val (balance, currency) = detectBalanceAndCurrency(visibleNodes, selectedBetButton?.target)
+        val panelTopY = betButtons.firstOrNull()?.target?.bounds?.top ?: stakeField?.bounds?.top
         val phaseAnalysis = detectPhaseAndMultipliers(
             visibleNodes = visibleNodes,
             betButton = selectedBetButton?.target,
             cancelButton = cancelButton,
-            panelButtonsTopY = betButtons.firstOrNull()?.target?.bounds?.top
-                ?: stakeField?.bounds?.top
+            panelButtonsTopY = panelTopY
+        )
+        val settlementEvidence = detectAutoCashOutAndOutcome(
+            visibleNodes = visibleNodes,
+            panelNodes = panelNodes,
+            stakeField = stakeField,
+            stageFloorY = panelTopY ?: Int.MAX_VALUE
         )
 
         return ScreenMap(
@@ -220,6 +239,10 @@ object AccessibilityController {
             panelCount = panelCount,
             usingHandIndex = selectedIndex,
             hasImeWindow = hasImeWindow,
+            autoCashOutState = settlementEvidence.autoCashOutState,
+            autoCashOutTarget = settlementEvidence.autoCashOutTarget,
+            cashedOutMultiplier = settlementEvidence.cashedOutMultiplier,
+            winBannerAmount = settlementEvidence.winBannerAmount,
             conflictReason = null
         )
     }
@@ -337,11 +360,11 @@ object AccessibilityController {
         val plusStepper = panelNodes.firstOrNull { isStakeStepperPlus(it.target) }?.target
         val editableFields = panelNodes
             .map { it.target }
-            .filter { it.isEditable || isNumericInputLike(it) }
+            .filter { isNumericFieldCandidate(it, minusStepper, plusStepper) }
 
         return selectStakeField(editableFields, betButton, minusStepper, plusStepper)
             ?: selectStakeField(
-                visibleNodes.map { it.target }.filter { it.isEditable || isNumericInputLike(it) },
+                visibleNodes.map { it.target }.filter { isNumericFieldCandidate(it, minusStepper, plusStepper) },
                 betButton,
                 minusStepper,
                 plusStepper
@@ -383,30 +406,109 @@ object AccessibilityController {
     }
 
     private fun findBetActionButtons(nodes: List<ScannedNode>): List<ScannedNode> {
-        return nodes.filter { node ->
+        val nodeById = nodes.associateBy { it.id }
+        val childrenByParent = nodes.filter { it.parentId != null }.groupBy { it.parentId!! }
+        val maxScreenWidth = nodes.maxOfOrNull { it.target.bounds.right } ?: 1080
+        val matchedIds = linkedSetOf<String>()
+        val results = mutableListOf<ScannedNode>()
+
+        fun isActionBetText(lower: String): Boolean {
+            if (lower.contains("auto bet") || lower.contains("cancel") || lower.contains("cash")) return false
+            return lower == "bet" ||
+                lower == "place bet" ||
+                lower == "bet now" ||
+                ((lower.startsWith("bet\n") || lower.startsWith("bet ")) &&
+                    (lower.contains("tzs") || lower.contains("usd") || lower.contains("kes") ||
+                        lower.contains("ugx") || lower.contains("ngn") || lower.contains("ghs") ||
+                        lower.contains("zmw") || Regex("\\d").containsMatchIn(lower)))
+        }
+
+        fun collectDescendantTexts(rootId: String): List<String> {
+            val texts = mutableListOf<String>()
+            val queue = ArrayDeque<String>()
+            childrenByParent[rootId].orEmpty().forEach { queue.add(it.id) }
+            var steps = 0
+            while (queue.isNotEmpty() && steps < 16) {
+                val cid = queue.removeFirst()
+                steps++
+                val c = nodeById[cid] ?: continue
+                if (c.target.isEditable || c.target.className.contains("EditText", ignoreCase = true)) {
+                    return emptyList()
+                }
+                val t = c.target.primaryText().trim()
+                if (t.isNotBlank()) texts += t
+                childrenByParent[cid].orEmpty().forEach { queue.add(it.id) }
+            }
+            return texts
+        }
+
+        // 1) Direct Bet button nodes (and promote clickable button parent when child is non-clickable "BET" label)
+        for (node in nodes) {
             val target = node.target
             val txt = target.primaryText().trim()
             val lower = txt.lowercase()
             val viewLower = target.viewId.lowercase()
             val isExplicitTab = isTabButton(target, "bet", nodes) || isTabButton(target, "auto", nodes)
-            if (isExplicitTab) return@filter false
+            if (isExplicitTab) continue
 
-            val looksLikeBetText = lower == "bet" && (
+            val looksLikeBetText = (lower == "bet" && (
                 target.bounds.height >= 44 ||
                     viewLower.contains("bet") ||
                     target.isClickable ||
                     target.className.contains("Button", ignoreCase = true)
-                ) ||
-                lower == "place bet" ||
-                lower == "bet now" ||
-                (lower.startsWith("bet\n") || lower.startsWith("bet ")) &&
-                (lower.contains("tzs") || lower.contains("usd") || lower.contains("kes") ||
-                    lower.contains("ugx") || lower.contains("ngn") || lower.contains("ghs") ||
-                    lower.contains("zmw") || Regex("\\d").containsMatchIn(lower))
+                )) || isActionBetText(lower)
 
             val looksLikeBetId = viewLower.contains("bet_button") || viewLower == "btn_bet"
-            (looksLikeBetText || looksLikeBetId) && !lower.contains("auto bet")
+            if ((looksLikeBetText || looksLikeBetId) && !lower.contains("auto bet")) {
+                val parent = node.parentId?.let { nodeById[it] }
+                val parentLower = parent?.target?.primaryText()?.trim()?.lowercase().orEmpty()
+                val promoteParent = !target.isClickable &&
+                    parent != null &&
+                    (parent.target.isClickable || parent.target.className.contains("Button", ignoreCase = true)) &&
+                    parent.target.bounds.height in 40..360 &&
+                    parent.target.bounds.width in 80..(maxScreenWidth * 0.78f).toInt() &&
+                    !parentLower.contains("auto") &&
+                    !parentLower.contains("cancel") &&
+                    !parentLower.contains("cash")
+                val chosen = if (promoteParent && parent != null) {
+                    parent.copy(
+                        target = parent.target.copy(
+                            text = parent.target.text.ifBlank { txt }
+                        )
+                    )
+                } else {
+                    node
+                }
+                if (matchedIds.add(chosen.id)) {
+                    results += chosen
+                }
+            }
         }
+
+        // 2) Compound WebView <button clickable=true text=""> with child texts like "BET" + "20.00 TZS"
+        for (node in nodes) {
+            if (node.id in matchedIds) continue
+            val t = node.target
+            if (!(t.isClickable || t.className.contains("Button", ignoreCase = true))) continue
+            if (t.isEditable || t.primaryText().isNotBlank()) continue
+            if (t.bounds.width < 80 || t.bounds.width > (maxScreenWidth * 0.78f).toInt()) continue
+            if (t.bounds.height !in 40..360) continue
+            val childTexts = collectDescendantTexts(node.id)
+            if (childTexts.isEmpty()) continue
+            val combinedLower = childTexts.joinToString(" ").trim().lowercase()
+            val hasExplicitBetChild = childTexts.any { it.trim().equals("bet", ignoreCase = true) } ||
+                isActionBetText(combinedLower)
+            val excluded = combinedLower.contains("auto") ||
+                combinedLower.contains("cancel") ||
+                combinedLower.contains("cash")
+            if (hasExplicitBetChild && !excluded && matchedIds.add(node.id)) {
+                results += node.copy(
+                    target = t.copy(text = childTexts.joinToString("\n"))
+                )
+            }
+        }
+
+        return results
     }
 
     private fun isTabButton(
@@ -420,12 +522,11 @@ object AccessibilityController {
         if (id.contains("tab")) return true
         // Only treat small "bet"/"auto" labels as tabs when an "auto" / "bet" tab neighbor sits on the same row
         val peerLabel = if (label == "bet") "auto" else "bet"
-        val hasRowPeer = allNodes.any { other ->
+        return allNodes.any { other ->
             other.target.nodeId != target.nodeId &&
                 other.target.primaryText().trim().lowercase() == peerLabel &&
                 abs(other.target.bounds.centerY - target.bounds.centerY) <= 40f
         }
-        return hasRowPeer || target.bounds.height in 1..43
     }
 
     private fun isCancelButton(target: UiTarget): Boolean {
@@ -444,6 +545,36 @@ object AccessibilityController {
         val txt = target.primaryText().trim()
         val id = target.viewId.lowercase()
         return txt == "+" || id.contains("plus") || id.contains("increase")
+    }
+
+    private fun isNumericFieldCandidate(
+        target: UiTarget,
+        minusStepper: UiTarget?,
+        plusStepper: UiTarget?
+    ): Boolean {
+        val txt = target.primaryText().trim()
+        val idLower = target.viewId.lowercase()
+        if (idLower.contains("cashout") || idLower.contains("autocash") || idLower.contains("auto_cash")) {
+            return false
+        }
+        if (ANY_MULTIPLIER_REGEX.containsMatchIn(txt)) {
+            return false
+        }
+        if (target.isEditable) return true
+        if (isNumericInputLike(target)) return true
+        if (txt.contains("bet", ignoreCase = true)) return false
+        val hasNumeric = parseNumericValue(txt) != null
+        if (hasNumeric && (idLower.contains("stake") || idLower.contains("amount_input") || idLower.contains("bet_input"))) {
+            return true
+        }
+        if (hasNumeric && minusStepper != null && plusStepper != null) {
+            val alignedWithRow = target.bounds.verticalOverlap(minusStepper.bounds) > 0 &&
+                target.bounds.verticalOverlap(plusStepper.bounds) > 0
+            val strictlyBetween = target.bounds.centerX > minusStepper.bounds.centerX &&
+                target.bounds.centerX < plusStepper.bounds.centerX
+            if (alignedWithRow && strictlyBetween) return true
+        }
+        return false
     }
 
     private fun isNumericInputLike(target: UiTarget): Boolean {
@@ -637,6 +768,109 @@ object AccessibilityController {
             lastCrashMultiplier = lastCrash,
             phase = phase,
             ribbonMultipliers = ribbonMultipliers
+        )
+    }
+
+    private data class AutoCashOutAndOutcome(
+        val autoCashOutState: SwitchState = SwitchState.UNREADABLE,
+        val autoCashOutTarget: Double? = null,
+        val cashedOutMultiplier: Double? = null,
+        val winBannerAmount: Double? = null
+    )
+
+    private fun detectAutoCashOutAndOutcome(
+        visibleNodes: List<ScannedNode>,
+        panelNodes: List<ScannedNode>,
+        stakeField: UiTarget?,
+        stageFloorY: Int
+    ): AutoCashOutAndOutcome {
+        val autoCashLabel = panelNodes.firstOrNull { node ->
+            val txt = node.target.primaryText().lowercase()
+            val id = node.target.viewId.lowercase()
+            (txt.contains("auto cash") || txt.contains("autocash") ||
+                id.contains("auto_cash") || id.contains("autocash")) &&
+                !txt.contains("auto bet")
+        }
+
+        var autoState = SwitchState.UNREADABLE
+        var autoTarget: Double? = null
+
+        if (autoCashLabel != null) {
+            val rowNodes = panelNodes.filter { n ->
+                val sameParent = autoCashLabel.parentId != null && n.parentId == autoCashLabel.parentId
+                val sameRow = abs(n.target.bounds.centerY - autoCashLabel.target.bounds.centerY) <= 100f
+                sameParent || sameRow
+            }
+            val switchNode = if (autoCashLabel.target.isCheckable && autoCashLabel.target.isChecked != null) {
+                autoCashLabel
+            } else {
+                rowNodes.firstOrNull { n ->
+                    n.target.isCheckable && n.target.isChecked != null &&
+                        !n.target.primaryText().lowercase().contains("auto bet")
+                }
+            }
+            if (switchNode?.target?.isChecked != null) {
+                autoState = if (switchNode.target.isChecked) SwitchState.ON else SwitchState.OFF
+            } else {
+                val explicitTextSwitch = rowNodes.firstOrNull { n ->
+                    val t = n.target.primaryText().trim().lowercase()
+                    t == "on" || t == "off"
+                }?.target?.primaryText()?.trim()?.lowercase()
+                if (explicitTextSwitch == "on") autoState = SwitchState.ON
+                else if (explicitTextSwitch == "off") autoState = SwitchState.OFF
+            }
+
+            val targetCandidate = rowNodes.firstOrNull { n ->
+                val t = n.target
+                val lower = t.primaryText().trim().lowercase()
+                val idLower = t.viewId.lowercase()
+                t.nodeId != stakeField?.nodeId &&
+                    t.nodeId != autoCashLabel.id &&
+                    !lower.contains("auto") &&
+                    !lower.contains("cancel") &&
+                    !lower.contains("bet") &&
+                    lower != "-" && lower != "+" && lower != "−" &&
+                    (t.isEditable || idLower.contains("cashout") || idLower.contains("target") ||
+                        ANY_MULTIPLIER_REGEX.containsMatchIn(lower) || parseNumericValue(lower) != null)
+            }
+            autoTarget = targetCandidate?.let { parseNumericValue(it.target.primaryText()) }
+                ?.takeIf { it >= 1.01 }
+        }
+
+        val bannerPool = visibleNodes.filter { node ->
+            node.target.bounds.centerY < stageFloorY || panelNodes.any { it.id == node.id }
+        }
+        var cashedOutMult: Double? = null
+        var winAmount: Double? = null
+        for (node in bannerPool) {
+            val txt = node.target.primaryText().trim()
+            val lower = txt.lowercase()
+            val idLower = node.target.viewId.lowercase()
+            val isCashOutOfferButton = lower.startsWith("cash out") || lower.startsWith("cashout")
+            if (isCashOutOfferButton) continue
+
+            val isConfirmedOutcome = lower.contains("cashed out") ||
+                lower.contains("you won") ||
+                idLower.contains("win_banner") ||
+                idLower.contains("cashed_out") ||
+                idLower.contains("my_cashout")
+            if (isConfirmedOutcome) {
+                if (cashedOutMult == null) {
+                    cashedOutMult = ANY_MULTIPLIER_REGEX.find(txt)?.groupValues?.getOrNull(1)
+                        ?.toDoubleOrNull()?.takeIf { it >= 1.01 }
+                }
+                if (winAmount == null) {
+                    val withoutMult = ANY_MULTIPLIER_REGEX.replace(txt, " ")
+                    winAmount = parseNumericValue(withoutMult)?.takeIf { it > 0.0 }
+                }
+            }
+        }
+
+        return AutoCashOutAndOutcome(
+            autoCashOutState = autoState,
+            autoCashOutTarget = autoTarget,
+            cashedOutMultiplier = cashedOutMult,
+            winBannerAmount = winAmount
         )
     }
 

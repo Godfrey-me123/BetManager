@@ -8,10 +8,12 @@ import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.outlined.Analytics
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.ReceiptLong
 import androidx.compose.material.icons.outlined.Settings
@@ -24,6 +26,7 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -35,6 +38,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.example.MainActivity
 import com.example.ui.BetManagerViewModel
 
 enum class BetManagerTab(
@@ -45,14 +49,18 @@ enum class BetManagerTab(
     val testTag: String
 ) {
     HOME("home", "Home", Icons.Filled.Home, Icons.Outlined.Home, "nav_home"),
-    SETTINGS("settings", "Settings", Icons.Filled.Settings, Icons.Outlined.Settings, "nav_settings"),
     STRATEGY("strategy", "Strategy", Icons.Filled.Tune, Icons.Outlined.Tune, "nav_strategy"),
+    PATTERNS("patterns", "Patterns", Icons.Filled.Analytics, Icons.Outlined.Analytics, "nav_patterns"),
+    SETTINGS("settings", "Settings", Icons.Filled.Settings, Icons.Outlined.Settings, "nav_settings"),
     LOGS("logs", "Logs", Icons.Filled.ReceiptLong, Icons.Outlined.ReceiptLong, "nav_logs")
 }
 
 @Composable
 fun BetManagerRoot(
     viewModel: BetManagerViewModel,
+    requestedTab: Int = -1,
+    onRequestedTabConsumed: () -> Unit = {},
+    onSwitchToOverlay: () -> Unit = {},
     onExitActivity: () -> Unit = {}
 ) {
     val navController = rememberNavController()
@@ -61,7 +69,11 @@ fun BetManagerRoot(
 
     val engineState by viewModel.engineState.collectAsStateWithLifecycle()
     val config by viewModel.config.collectAsStateWithLifecycle()
-    val rules by viewModel.rules.collectAsStateWithLifecycle()
+    val customStrategies by viewModel.customStrategies.collectAsStateWithLifecycle()
+    val patternOccurrences by viewModel.patternOccurrences.collectAsStateWithLifecycle()
+    val statisticalReport by viewModel.statisticalReport.collectAsStateWithLifecycle()
+    val agentExplanation by viewModel.agentExplanation.collectAsStateWithLifecycle()
+    val selectedPatternGameId by viewModel.selectedPatternGameId.collectAsStateWithLifecycle()
     val lastFiveResults by viewModel.lastFiveResults.collectAsStateWithLifecycle()
     val todayProfit by viewModel.todayProfit.collectAsStateWithLifecycle()
     val logs by viewModel.logs.collectAsStateWithLifecycle()
@@ -78,6 +90,19 @@ fun BetManagerRoot(
             }
             launchSingleTop = true
             restoreState = true
+        }
+    }
+
+    LaunchedEffect(requestedTab) {
+        if (requestedTab >= 0) {
+            val target = when (requestedTab) {
+                MainActivity.TAB_STRATEGY -> BetManagerTab.STRATEGY
+                MainActivity.TAB_HOURLY_ANALYSIS -> BetManagerTab.PATTERNS
+                MainActivity.TAB_LIVE_MONITOR -> BetManagerTab.HOME
+                else -> BetManagerTab.HOME
+            }
+            selectTab(target)
+            onRequestedTabConsumed()
         }
     }
 
@@ -100,7 +125,7 @@ fun BetManagerRoot(
                                         contentDescription = tab.label
                                     )
                                 },
-                                label = { Text(tab.label) },
+                                label = { Text(tab.label, maxLines = 1) },
                                 modifier = Modifier.testTag(tab.testTag)
                             )
                         }
@@ -150,15 +175,41 @@ fun BetManagerRoot(
                             onToggleFloatingHand = viewModel::toggleFloatingHandOverlay,
                             onToggleHandAutoBet = viewModel::toggleHandAutoBet,
                             onToggleKeepScreenAwake = viewModel::toggleKeepScreenAwake,
+                            onCancelAlarm = viewModel::cancelActiveAlarm,
+                            onSwitchToOverlay = {
+                                viewModel.switchToOverlayMode(onMinimized = onSwitchToOverlay)
+                            },
                             onExitApp = {
                                 viewModel.exitApp()
                                 onExitActivity()
                             }
                         )
                     }
+                    composable(BetManagerTab.STRATEGY.route) {
+                        StrategyScreen(
+                            currentConfig = config,
+                            customStrategies = customStrategies,
+                            patternOccurrences = patternOccurrences,
+                            onSaveCustomStrategy = viewModel::saveCustomStrategy,
+                            onToggleCustomStrategyEnabled = viewModel::toggleCustomStrategyEnabled,
+                            onToggleCustomStrategyNotifications = viewModel::toggleCustomStrategyNotifications,
+                            onDeleteCustomStrategy = viewModel::deleteCustomStrategy,
+                            onReorderStrategies = viewModel::reorderCustomStrategies,
+                            onSaveConfig = viewModel::saveStrategyConfig
+                        )
+                    }
+                    composable(BetManagerTab.PATTERNS.route) {
+                        PatternRecognitionScreen(
+                            report = statisticalReport,
+                            agentExplanation = agentExplanation,
+                            selectedGameId = selectedPatternGameId,
+                            onSelectGameId = viewModel::selectPatternGameId
+                        )
+                    }
                     composable(BetManagerTab.SETTINGS.route) {
                         SimpleSettingsScreen(
                             config = config,
+                            isAlarmActive = engineState.isAlarmActive,
                             alarmHighSignalEnabled = alarmHighSignalEnabled,
                             preSignalNotificationEnabled = preSignalNotificationEnabled,
                             alertSoundEnabled = alertSoundEnabled,
@@ -167,6 +218,7 @@ fun BetManagerRoot(
                             onAfterLossModeChange = viewModel::updateAfterLossMode,
                             onAddAmountChange = viewModel::updateAddAmount,
                             onStopAfterLossesChange = viewModel::updateStopAfterLosses,
+                            onCashOutTargetChange = viewModel::updateCashOutTarget,
                             onBettingModeChange = viewModel::updateBettingMode,
                             onDailyLossLimitChange = viewModel::updateDailyLossLimit,
                             onDailyProfitTargetChange = viewModel::updateDailyProfitTarget,
@@ -175,25 +227,20 @@ fun BetManagerRoot(
                             onStakeToleranceChange = viewModel::updateStakeTolerance,
                             onResetOverlayPosition = viewModel::resetFloatingHandPosition,
                             onResetStakeToBase = viewModel::resetStakeToBase,
+                            onCancelAlarm = viewModel::cancelActiveAlarm,
                             onToggleAlarmHighSignal = viewModel::toggleAlarmHighSignal,
                             onTogglePreSignalNotification = viewModel::togglePreSignalNotification,
                             onToggleAlertSound = viewModel::toggleAlertSound,
-                            onToggleAlertVibration = viewModel::toggleAlertVibration
-                        )
-                    }
-                    composable(BetManagerTab.STRATEGY.route) {
-                        StrategyScreen(
-                            rules = rules,
-                            bettingMode = config.bettingMode,
-                            onToggleRule = viewModel::toggleRule,
-                            onAddRule = viewModel::addRule,
-                            onDeleteRule = viewModel::deleteRule
+                            onToggleAlertVibration = viewModel::toggleAlertVibration,
+                            onSaveConfig = viewModel::saveStrategyConfig
                         )
                     }
                     composable(BetManagerTab.LOGS.route) {
                         LogsScreen(
                             logs = logs,
-                            onClearLogs = viewModel::clearLogs
+                            onClearLogs = viewModel::clearLogs,
+                            onCopyLogs = viewModel::copyLogsToClipboard,
+                            onShareLogs = viewModel::shareLogs
                         )
                     }
                 }

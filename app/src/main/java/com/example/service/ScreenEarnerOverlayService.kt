@@ -38,15 +38,27 @@ object ScreenEarnerOverlayService {
     fun updateStatusNotification(context: Context, isRunning: Boolean, statusLine: String) {
         ensureChannel(context)
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+        val pi = if (ScreenEarnerAccessibilityService.instance != null) {
+            val overlayIntent = Intent(context, AlarmActionReceiver::class.java).apply {
+                action = AlarmActionReceiver.ACTION_OPEN_OVERLAY
+            }
+            PendingIntent.getBroadcast(
+                context,
+                4102,
+                overlayIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            PendingIntent.getActivity(
+                context,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
         }
-        val pi = PendingIntent.getActivity(
-            context,
-            0,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
 
         val title = if (isRunning) {
             context.getString(R.string.overlay_notification_title)

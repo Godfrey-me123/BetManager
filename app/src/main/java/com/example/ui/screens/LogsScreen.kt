@@ -16,11 +16,14 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.outlined.ReceiptLong
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -55,6 +58,8 @@ private enum class LogFilter(val label: String) {
 fun LogsScreen(
     logs: List<DiagnosticLogEntry>,
     onClearLogs: () -> Unit,
+    onCopyLogs: () -> Unit = {},
+    onShareLogs: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var selectedFilter by remember { mutableStateOf(LogFilter.ALL) }
@@ -98,12 +103,37 @@ fun LogsScreen(
                     style = MaterialTheme.typography.headlineMedium,
                     color = MaterialTheme.colorScheme.onBackground
                 )
-                if (logs.isNotEmpty()) {
-                    TextButton(
-                        onClick = onClearLogs,
-                        modifier = Modifier.testTag("clear_logs_button")
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onCopyLogs,
+                        modifier = Modifier.testTag("copy_logs_button")
                     ) {
-                        Text("Clear")
+                        Icon(
+                            imageVector = Icons.Default.ContentCopy,
+                            contentDescription = "Copy Logs",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    IconButton(
+                        onClick = onShareLogs,
+                        modifier = Modifier.testTag("share_logs_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share Logs",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (logs.isNotEmpty()) {
+                        TextButton(
+                            onClick = onClearLogs,
+                            modifier = Modifier.testTag("clear_logs_button")
+                        ) {
+                            Text("Clear")
+                        }
                     }
                 }
             }

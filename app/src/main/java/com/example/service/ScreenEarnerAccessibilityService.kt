@@ -92,7 +92,9 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
         driver = AutoTouchDriver(platform)
         scheduler = ScanScheduler(platform)
         val alertManager = PatternAlertManager(applicationContext, repository)
-        engine.patternAlertManager = alertManager
+        val strategyNotifManager = StrategyNotificationManager(applicationContext, repository)
+        engine.attachPatternAlertManager(alertManager)
+        engine.attachStrategyNotificationManager(strategyNotifManager)
         engine.attachAccessibility(driver, scheduler)
 
         overlayManager = FloatingHandsOverlayManager(
@@ -130,6 +132,7 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
             onOpenApp = {
                 startActivity(
                     Intent(this, MainActivity::class.java)
+                        .putExtra(MainActivity.EXTRA_FULL_SCREEN, true)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 )
             },
@@ -146,57 +149,144 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
                         Toast.LENGTH_SHORT
                     ).show()
                 }
+            },
+            onCancelAlarm = {
+                engine.cancelActiveAlarm()
+                serviceScope.launch(Dispatchers.Main) {
+                    Toast.makeText(this@ScreenEarnerAccessibilityService, "Alarm stopped", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onSelectAfterLossMode = { mode ->
+                serviceScope.launch {
+                    val c = repository.getConfig()
+                    repository.saveConfig(c.copy(afterLoss = mode).syncProgressionFromLegacy())
+                    engine.syncStakeWithConfig()
+                }
+            },
+            onSelectBettingMode = { mode ->
+                serviceScope.launch {
+                    val c = repository.getConfig()
+                    repository.saveConfig(c.copy(bettingMode = mode))
+                    engine.syncStakeWithConfig()
+                }
+            },
+            onToggleCustomStrategy = { strategy, enabled ->
+                serviceScope.launch {
+                    engine.setCustomStrategyEnabledWithBaseline(strategy, enabled)
+                }
+            },
+            onToggleAlarmHighSignal = {
+                val next = !repository.isAlarmHighSignalEnabled()
+                repository.setAlarmHighSignalEnabled(next)
+                serviceScope.launch {
+                    val s = repository.getNotificationSettings()
+                    repository.saveNotificationSettings(s.copy(highPriorityAlarmEnabled = next))
+                }
+            },
+            onTogglePreSignal = {
+                val next = !repository.isPreSignalNotificationEnabled()
+                repository.setPreSignalNotificationEnabled(next)
+                serviceScope.launch {
+                    val s = repository.getNotificationSettings()
+                    repository.saveNotificationSettings(s.copy(approachingEnabled = next))
+                }
+            },
+            onToggleAlertSound = {
+                val next = !repository.isAlertSoundEnabled()
+                repository.setAlertSoundEnabled(next)
+                serviceScope.launch {
+                    val s = repository.getNotificationSettings()
+                    repository.saveNotificationSettings(s.copy(soundEnabled = next))
+                }
+            },
+            onToggleAlertVibration = {
+                val next = !repository.isAlertVibrationEnabled()
+                repository.setAlertVibrationEnabled(next)
+                serviceScope.launch {
+                    val s = repository.getNotificationSettings()
+                    repository.saveNotificationSettings(s.copy(vibrationEnabled = next))
+                }
             }
         )
 
         stateObserverJob?.cancel()
         stateObserverJob = serviceScope.launch {
-            combine(
+            val coreFlow = combine(
                 engine.state,
                 repository.configFlow,
                 repository.lastFiveBetResultsFlow,
                 repository.todayProfitFlow(),
                 repository.keepScreenAwakeFlow
             ) { ui, config, last, profit, keepAwake ->
-                OverlayData(ui, config, last, profit, keepAwake)
-            }.collectLatest { d ->
-                val ui = d.ui
-                if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
-                val stake = if (ui.isRunning) ui.currentStake else d.config.baseStake
-                overlayManager?.update(
-                    OverlayInfo(
-                        isRunning = ui.isRunning,
-                        statusLine = ui.statusLine,
-                        gameLine = "${ui.gameName} · ${ui.siteUrl}",
-                        balanceText = ui.balance?.let { "%.2f %s".format(it, ui.currency) } ?: "--",
-                        stakeText = "%.2f %s".format(stake, ui.currency),
-                        lossStreak = ui.consecutiveLosses,
-                        phaseText = ui.phase.name.lowercase().replace('_', ' '),
-                        multiplierText = ui.liveMultiplier?.let { "%.2fx".format(it) } ?: "",
-                        latestCrashText = ui.latestCrashMultiplier?.let { "%.2fx".format(it) } ?: "--",
-                        monitoredCrashes = ui.monitoredCrashCount,
-                        todayProfitText = "%+.2f".format(d.profit),
-                        lastResults = d.last.mapNotNull { it.won }.reversed(),
-                        handState = ui.handState,
-                        betTargetDetected = ui.betTargetDetected,
-                        handAutoBetEnabled = ui.handAutoBetEnabled,
-                        keepScreenAwake = d.keepScreenAwake,
-                        canEditStake = !ui.isRunning,
-                        recordedMultipliers = ui.recordedMultipliers,
-                        patternSummary = ui.patternProgress.statusText,
-                        isPatternMatched = ui.isPatternMatched
-                    )
-                )
+                OverlayCoreData(ui, config, last, profit, keepAwake)
             }
+            val prefsFlow = combine(
+                repository.customStrategiesFlow,
+                repository.alarmHighSignalFlow,
+                repository.preSignalNotificationFlow,
+                repository.alertSoundFlow,
+                repository.alertVibrationFlow
+            ) { customStrategies, highAlarm, preSig, sound, vibrate ->
+                OverlayPrefsData(customStrategies, highAlarm, preSig, sound, vibrate)
+            }
+
+            combine(coreFlow, prefsFlow) { core, prefs -> core to prefs }
+                .collectLatest { (d, p) ->
+                    val ui = d.ui
+                    if (d.config.showFloatingHand) overlayManager?.show() else overlayManager?.hide()
+                    val stake = if (ui.isRunning || ui.consecutiveLosses > 0 || ui.recoveryDeficit > 0.01) ui.currentStake else d.config.baseStake
+                    overlayManager?.update(
+                        OverlayInfo(
+                            isRunning = ui.isRunning,
+                            statusLine = ui.statusLine,
+                            gameLine = "${ui.gameName} · ${ui.siteUrl}",
+                            balanceText = ui.balance?.let { "%.2f %s".format(it, ui.currency) } ?: "--",
+                            stakeText = "%.2f %s".format(stake, ui.currency),
+                            lossStreak = ui.consecutiveLosses,
+                            phaseText = ui.phase.name.lowercase().replace('_', ' '),
+                            multiplierText = ui.liveMultiplier?.let { "%.2fx".format(it) } ?: "",
+                            latestCrashText = ui.latestCrashMultiplier?.let { "%.2fx".format(it) } ?: "--",
+                            monitoredCrashes = ui.monitoredCrashCount,
+                            todayProfitText = "%+.2f".format(d.profit),
+                            lastResults = d.last.mapNotNull { it.won }.reversed(),
+                            handState = ui.handState,
+                            betTargetDetected = ui.betTargetDetected,
+                            handAutoBetEnabled = ui.handAutoBetEnabled,
+                            keepScreenAwake = d.keepScreenAwake,
+                            canEditStake = !ui.isRunning,
+                            recordedMultipliers = ui.recordedMultipliers,
+                            patternSummary = ui.patternProgress.statusText,
+                            isPatternMatched = ui.isPatternMatched,
+                            isAlarmActive = ui.isAlarmActive,
+                            activeAlarmTitle = ui.activeAlarmTitle,
+                            afterLossMode = d.config.afterLoss,
+                            bettingMode = d.config.bettingMode,
+                            cashOutTarget = d.config.cashOutTarget,
+                            customStrategies = p.customStrategies,
+                            alarmHighSignalEnabled = p.alarmHighSignalEnabled,
+                            preSignalEnabled = p.preSignalEnabled,
+                            alertSoundEnabled = p.alertSoundEnabled,
+                            alertVibrationEnabled = p.alertVibrationEnabled
+                        )
+                    )
+                }
         }
     }
 
-    private class OverlayData(
+    private class OverlayCoreData(
         val ui: com.example.data.engine.EngineUiState,
         val config: com.example.data.model.StrategyConfig,
         val last: List<com.example.data.model.RoundRecord>,
         val profit: Double,
         val keepScreenAwake: Boolean
+    )
+
+    private class OverlayPrefsData(
+        val customStrategies: List<com.example.data.model.CustomPatternStrategy>,
+        val alarmHighSignalEnabled: Boolean,
+        val preSignalEnabled: Boolean,
+        val alertSoundEnabled: Boolean,
+        val alertVibrationEnabled: Boolean
     )
 
     /** Overlay stake -/+ : only while stopped. Step scales with the base stake. */
@@ -209,9 +299,14 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
                 c.baseStake >= 20 -> 10.0
                 else -> 1.0
             }
+            val cur = engine.state.value
             val newBase = maxOf(1.0, c.baseStake + dir * step)
             repository.saveConfig(c.copy(baseStake = newBase))
-            repository.saveSessionProgression(newBase, 0)
+            val resetProg = cur.consecutiveLosses == 0 && cur.recoveryDeficit <= 0.01
+            if (resetProg) {
+                repository.saveSessionProgression(newBase, 0, 0.0)
+            }
+            engine.syncStakeWithConfig(resetProgression = resetProg)
         }
     }
 
@@ -273,6 +368,11 @@ class ScreenEarnerAccessibilityService : AccessibilityService() {
 
     fun showFloatingHand() {
         overlayManager?.show()
+    }
+
+    fun showAndExpandOverlay() {
+        overlayManager?.show()
+        overlayManager?.setExpanded(true)
     }
 
     fun hideFloatingHand() {

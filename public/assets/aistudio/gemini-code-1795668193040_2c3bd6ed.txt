@@ -1,0 +1,12 @@
+Fix the keyboard dismissal/layout-settle hang, balance null handling, and unconfirmed bet locking in this BetManager Android project while keeping unrelated features intact:
+
+1. **Keyboard & Layout Settle (`AutoTouchDriver.kt`, `BetSequence.kt`)**:
+   - In `closeKeyboardAndWaitLayoutSettle(...)`, avoid getting stuck or returning `null` when the soft keyboard is open or layout bounds shift slightly. If `hasImeWindow()` is true, call `performGlobalBack()` and fall back cleanly to the latest valid `ScreenMap` when `betButton` is available rather than hanging or failing forever until the user manually dismisses the keyboard.
+   - Ensure `BetSequence.execute(...)` enforces bounded timeouts and returns a clear reason without stalling when stake read-back or keyboard close is delayed.
+
+2. **Balance Preservation (`AutomationEngine.kt`, `BetSequence.kt`)**:
+   - Keep the last known non-null `balance` in `EngineUiState` when a new `ScreenMap` reports `balance == null` (e.g., while the keyboard or a transient panel covers the header), instead of blanking it out or reporting balance unavailable.
+   - Only block on `balanceFloor` when `config.balanceFloor > 0.0` and a valid balance is unreadable when required; do not fail normal stake updates when `map.balance` is temporarily `null`.
+
+3. **Unconfirmed Bet Lock (`AutomationEngine.kt`)**:
+   - In `executeDirectCoordinateOrButtonClick(...)`, do not treat an unconfirmed tap as a confirmed bet lock when `betButton == null`; only lock/track a confirmed bet when placement/confirmation is verified so unconfirmed rounds do not corrupt state or settlement.

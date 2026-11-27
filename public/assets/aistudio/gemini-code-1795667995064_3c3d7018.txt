@@ -1,0 +1,21 @@
+Apply the following targeted fixes in this BetManager Android project (`betmanager.zip`) while keeping all unrelated features and screens intact:
+
+1. **Keyboard Dismissal, Timeout Guard & Balance Stability (`AutomationEngine.kt`, `BetSequence.kt`, `AutoTouchDriver.kt`, `AccessibilityController.kt`)**:
+   - Prevent the execution flow from getting stuck when the soft keyboard is open or when stake/balance read-back fails or times out: ensure keyboard dismissal / safe fallback runs before stake read-back/bet confirmation, and bound read-back/retry loops with explicit timeouts so updates never hang forever.
+   - Preserve the last known `balance` in `EngineUiState` when `map.balance` is temporarily `null` or obscured during an update instead of reporting balance unavailable/blanking it out, and only enforce balance-floor blocking when a valid balance value is present.
+
+2. **Prevent Betting on Already-Passed Patterns (`AutomationEngine.kt`, `CrashMonitorTracker.kt`, `StrategyEvaluator.kt`)**:
+   - Do not seed `liveRecordedMultipliers` with pre-existing `map.ribbonMultipliers` history on startup/first sight as if those rounds were newly observed triggers; only evaluate newly occurred live crash rounds and track evaluated pattern/round signatures immediately when seen so already-passed patterns cannot trigger bets.
+   - Keep `CrashMonitorTracker` baseline capture strictly non-importing (`0` historical imports) and ensure ribbon shifts and crash banner transitions never treat prior history as a fresh pattern match.
+
+3. **True Loss Recovery & Base-Stake Reset (`StakeCalculator.kt`, `AutomationEngine.kt`, `BetManagerViewModel.kt`, `BetManagerRepository.kt`)**:
+   - Track and persist `recoveryDeficit` (and `consecutiveLosses`) in `EngineUiState` and `BetManagerRepository` alongside `currentStake`.
+   - In `StakeCalculator.onWin(...)`, do not reset `nextStake` to `baseStake` and `consecutiveLosses = 0` on a single win if `newDeficit > 0.01` (unless full recovery is actually achieved or an explicit full-recovery rule is met); only return `nextStake` to `baseStake` and clear `consecutiveLosses` when recovery is complete.
+   - Ensure `syncStakeWithConfig(...)` and `processScreenMap(...)` do not wipe out an active recovery sequence or clobber `currentStake` when `recoveryDeficit > 0` or `consecutiveLosses > 0`.
+
+4. **Accurate Win/Loss & Profit Settlement (`AutomationEngine.kt`)**:
+   - Only create an `activeBet` when a BetManager bet is actually placed and confirmed—never lock or settle an unconfirmed bet as a win or loss.
+   - In `recordCurrentCrashAndSettle(...)`, compute `won` and `profitDelta` from actual confirmed bet/cash-out outcome so `RoundRecord`, `todayProfit`, and `Last: W/L` never record a loss when a bet won (or a win when a bet lost).
+
+5. **Real-Time Settings & Save-Button Reflection (`SimpleSettingsScreen.kt`, `StrategyScreen.kt`, `BetManagerViewModel.kt`, `BetManagerRepository.kt`, `AutomationEngine.kt`)**:
+   - Keep local form/draft state in `SimpleSettingsScreen.kt` and `StrategyScreen.kt` until Save is pressed, and on Save persist to `BetManagerRepository` and immediately call `engine.syncStakeWithConfig(...)` (and refresh bound rules/strategies) so `StateFlow` updates reflect in real time across the UI and engine.

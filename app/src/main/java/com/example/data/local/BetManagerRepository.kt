@@ -1,8 +1,17 @@
 package com.example.data.local
 
 import android.content.Context
+import com.example.data.model.AlarmProfileCategory
+import com.example.data.model.AlarmProfileEntity
+import com.example.data.model.CrashRecord
+import com.example.data.model.CustomPatternStrategy
 import com.example.data.model.DiagnosticLogEntry
 import com.example.data.model.LogCategory
+import com.example.data.model.MultiplierRecord
+import com.example.data.model.NotificationHistoryRecord
+import com.example.data.model.NotificationInteractionStatus
+import com.example.data.model.NotificationSettings
+import com.example.data.model.PatternOccurrenceRecord
 import com.example.data.model.RoundRecord
 import com.example.data.model.StrategyConfig
 import com.example.data.model.StrategyRule
@@ -44,6 +53,15 @@ class BetManagerRepository(
     val lastFiveBetResultsFlow: Flow<List<RoundRecord>> = dao.observeLastFiveBetResults()
     val logsFlow: Flow<List<DiagnosticLogEntry>> = dao.observeLogs()
 
+    val customStrategiesFlow: Flow<List<CustomPatternStrategy>> = dao.observeCustomStrategies()
+    val patternOccurrencesFlow: Flow<List<PatternOccurrenceRecord>> = dao.observePatternOccurrences()
+    val crashRecordsFlow: Flow<List<CrashRecord>> = dao.observeCrashRecords()
+    val multiplierRecordsFlow: Flow<List<MultiplierRecord>> = dao.observeMultiplierRecords()
+    val alarmProfilesFlow: Flow<List<AlarmProfileEntity>> = dao.observeAlarmProfiles()
+    val notificationSettingsFlow: Flow<NotificationSettings> =
+        dao.observeNotificationSettings().map { it ?: NotificationSettings() }
+    val notificationHistoryFlow: Flow<List<NotificationHistoryRecord>> = dao.observeNotificationHistory()
+
     fun todayProfitFlow(): Flow<Double> = dao.observeTodayProfit(startOfTodayMs())
 
     suspend fun ensureInitialized() {
@@ -63,6 +81,106 @@ class BetManagerRepository(
     suspend fun updateRule(rule: StrategyRule) = dao.updateRule(rule)
 
     suspend fun deleteRule(rule: StrategyRule) = dao.deleteRule(rule)
+
+    // --- 4-Strategy CustomPatternStrategy & PatternTelemetry ---
+
+    suspend fun getCustomStrategies(): List<CustomPatternStrategy> = dao.getCustomStrategies()
+
+    suspend fun saveCustomStrategy(strategy: CustomPatternStrategy): Long {
+        val assignedOrder = if (strategy.id == 0L && strategy.sortOrder == 0) {
+            dao.getMaxCustomStrategySortOrder() + 1
+        } else {
+            strategy.sortOrder
+        }
+        return dao.upsertCustomStrategy(strategy.copy(sortOrder = assignedOrder))
+    }
+
+    suspend fun updateCustomStrategy(strategy: CustomPatternStrategy) {
+        dao.updateCustomStrategy(strategy)
+    }
+
+    suspend fun setCustomStrategyEnabled(id: Long, enabled: Boolean) {
+        dao.setCustomStrategyEnabled(id, enabled)
+    }
+
+    suspend fun setCustomStrategyNotificationsEnabled(id: Long, enabled: Boolean) {
+        dao.setCustomStrategyNotificationsEnabled(id, enabled)
+    }
+
+    suspend fun deleteCustomStrategy(id: Long) {
+        dao.deleteCustomStrategyById(id)
+    }
+
+    suspend fun swapStrategyOrder(firstId: Long, secondId: Long) {
+        val list = dao.getCustomStrategies()
+        val firstIdx = list.indexOfFirst { it.id == firstId }
+        val secondIdx = list.indexOfFirst { it.id == secondId }
+        if (firstIdx < 0 || secondIdx < 0) return
+
+        val reordered = list.mapIndexed { idx, s ->
+            when (idx) {
+                firstIdx -> s.copy(sortOrder = secondIdx)
+                secondIdx -> s.copy(sortOrder = firstIdx)
+                else -> s.copy(sortOrder = idx)
+            }
+        }
+        reordered.forEach { dao.upsertCustomStrategy(it) }
+    }
+
+    suspend fun getCrashRecords(): List<CrashRecord> = dao.getCrashRecords()
+
+    suspend fun insertConfirmedCrashIfAbsent(
+        crashRecord: CrashRecord,
+        multiplierRecord: MultiplierRecord
+    ): Long {
+        dao.insertMultiplierRecord(multiplierRecord)
+        return dao.insertCrashRecord(crashRecord)
+    }
+
+    suspend fun getMultiplierRecords(): List<MultiplierRecord> = dao.getMultiplierRecords()
+
+    suspend fun recordPatternOccurrences(records: List<PatternOccurrenceRecord>) {
+        if (records.isNotEmpty()) {
+            dao.insertPatternOccurrences(records)
+        }
+    }
+
+    suspend fun recordPatternOccurrence(record: PatternOccurrenceRecord): Long {
+        return dao.insertPatternOccurrence(record)
+    }
+
+    suspend fun getNotificationSettings(): NotificationSettings {
+        return dao.getNotificationSettings() ?: NotificationSettings()
+    }
+
+    suspend fun saveNotificationSettings(settings: NotificationSettings) {
+        dao.upsertNotificationSettings(settings)
+    }
+
+    suspend fun getAlarmProfiles(): List<AlarmProfileEntity> {
+        val existing = dao.getAlarmProfiles()
+        return if (existing.isEmpty()) {
+            AlarmProfileEntity.defaultProfiles().also { dao.upsertAlarmProfiles(it) }
+        } else {
+            existing
+        }
+    }
+
+    suspend fun getAlarmProfile(category: AlarmProfileCategory): AlarmProfileEntity? {
+        return dao.getAlarmProfile(category.name)
+    }
+
+    suspend fun saveAlarmProfile(profile: AlarmProfileEntity) {
+        dao.upsertAlarmProfile(profile)
+    }
+
+    suspend fun addNotificationHistory(record: NotificationHistoryRecord): Long {
+        return dao.insertNotificationHistory(record)
+    }
+
+    suspend fun markNotificationInteraction(id: Long, status: NotificationInteractionStatus) {
+        dao.updateNotificationInteractionStatus(id, status)
+    }
 
     suspend fun getRecentRounds(): List<RoundRecord> = dao.getRecentRoundsOnce()
 
@@ -89,14 +207,31 @@ class BetManagerRepository(
         return if (raw > 0f) raw.toDouble() else defaultBase
     }
 
-    fun saveSessionProgression(currentStake: Double, consecutiveLosses: Int) {
+    fun getSavedRecoveryDeficit(): Double {
+        val raw = prefs.getFloat(KEY_RECOVERY_DEFICIT, 0f)
+        return if (raw > 0f) raw.toDouble() else 0.0
+    }
+
+    fun saveSessionProgression(currentStake: Double, consecutiveLosses: Int, recoveryDeficit: Double = 0.0) {
         prefs.edit()
             .putFloat(KEY_CURRENT_STAKE, currentStake.toFloat())
             .putInt(KEY_CONSECUTIVE_LOSSES, consecutiveLosses)
+            .putFloat(KEY_RECOVERY_DEFICIT, recoveryDeficit.toFloat())
             .apply()
     }
 
     fun getConsecutiveLosses(): Int = prefs.getInt(KEY_CONSECUTIVE_LOSSES, 0)
+
+    fun getConsumedTriggerSignatures(): Set<String> {
+        return prefs.getStringSet(KEY_CONSUMED_TRIGGERS, emptySet()) ?: emptySet()
+    }
+
+    fun saveConsumedTriggerSignature(signature: String) {
+        if (signature.isBlank()) return
+        val current = prefs.getStringSet(KEY_CONSUMED_TRIGGERS, emptySet()) ?: emptySet()
+        val updated = (current.filter { it != signature } + signature).takeLast(200).toSet()
+        prefs.edit().putStringSet(KEY_CONSUMED_TRIGGERS, updated).apply()
+    }
 
     fun getOverlayPosition(defaultX: Int, defaultY: Int): Pair<Int, Int> {
         val x = prefs.getInt(KEY_HAND_X, defaultX)
@@ -206,6 +341,8 @@ class BetManagerRepository(
     companion object {
         private const val KEY_CURRENT_STAKE = "current_stake"
         private const val KEY_CONSECUTIVE_LOSSES = "consecutive_losses"
+        private const val KEY_RECOVERY_DEFICIT = "recovery_deficit"
+        private const val KEY_CONSUMED_TRIGGERS = "consumed_trigger_signatures"
         private const val KEY_HAND_X = "overlay_hand_x"
         private const val KEY_HAND_Y = "overlay_hand_y"
         private const val KEY_BET_HAND_X = "bet_hand_x"
